@@ -1,0 +1,10 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+
+login_result.png
+consulta_rol_tramitar.png
+consulta_rol_tramitar_resultado.png
+ultima_accion.png
+*_elements.json
