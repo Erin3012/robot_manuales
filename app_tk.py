@@ -2,11 +2,15 @@ import queue
 import threading
 import tkinter as tk
 from datetime import datetime
+import tempfile
+from pathlib import Path
 from tkinter import messagebox, ttk
 
+import fitz
+from PIL import Image, ImageTk
 from selenium.common.exceptions import WebDriverException
 
-from main import LOGIN_URL, consult_case, create_driver, login_to_sitfa
+from main import LOGIN_URL, consult_case, create_driver, download_pdf_with_session, login_to_sitfa
 
 
 class BackendWorker:
@@ -50,12 +54,11 @@ class BackendWorker:
                             pass
                         driver = None
 
-                    browser = "edge" if payload.get("headless") else "ie"
-                    mode = "headless" if payload.get("headless") else "visible"
-                    self._log(f"Creando driver en modo {mode}")
+                    mode = "no visible" if payload.get("headless") else "visible"
+                    self._log(f"Creando driver en modo {mode} con Edge")
                     driver = create_driver(
                         initial_url=LOGIN_URL,
-                        browser=browser,
+                        browser="edge",
                         headless=bool(payload.get("headless")),
                     )
                     login_to_sitfa(driver, payload["username"], payload["password"], log_callback=self._log)
@@ -72,6 +75,19 @@ class BackendWorker:
                         section_callback=self._section_result,
                     )
                     self._emit("consult_success", {"rit": payload["rit"], "results": results})
+                    continue
+
+                if action == "open_pdf":
+                    if driver is None:
+                        raise RuntimeError("No hay una sesion activa.")
+                    pdf_url = (payload.get("pdf_url") or "").strip()
+                    if not pdf_url:
+                        raise RuntimeError("La fila no tiene PDF asociado.")
+                    prefix = (payload.get("prefix") or "pdf").strip() or "pdf"
+                    output_path = Path(tempfile.gettempdir()) / f"sitfa_{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.pdf"
+                    downloaded_path = download_pdf_with_session(driver, pdf_url, output_path)
+                    self._emit("log", {"message": f"PDF abierto: {downloaded_path.name}"})
+                    self._emit("pdf_opened", {"path": str(downloaded_path), "pdf_url": pdf_url})
                     continue
 
                 self._emit("error", {"message": f"Accion desconocida: {action}"})
@@ -92,7 +108,7 @@ class SitfaApp(tk.Tk):
 
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
-        self.headless_var = tk.BooleanVar(value=False)
+        self.headless_var = tk.BooleanVar(value=True)
         self.rit_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ingrese sus credenciales para iniciar sesion.")
         self.session_var = tk.StringVar(value="Sin sesion iniciada")
@@ -106,7 +122,15 @@ class SitfaApp(tk.Tk):
         self.escritos_tree = None
         self.litigantes_tree = None
         self.cons_lit_tree = None
+        self.pdf_canvas = None
+        self.pdf_scrollbar = None
+        self.pdf_inner_frame = None
+        self.pdf_status_var = tk.StringVar(value="Sin PDF cargado")
+        self.pdf_zoom_var = tk.DoubleVar(value=1.35)
         self.log_text = None
+        self._section_rows: dict[str, list[dict]] = {}
+        self._pdf_images: list[ImageTk.PhotoImage] = []
+        self._current_pdf_path: str | None = None
 
         self._build_login_frame()
         self._build_case_frame()
@@ -166,8 +190,15 @@ class SitfaApp(tk.Tk):
         self.exit_button = ttk.Button(action_bar, text="Salir", command=self._on_close)
         self.exit_button.pack(side="right")
 
-        notebook = ttk.Notebook(self.case_frame)
-        notebook.pack(fill="both", expand=True)
+        content = ttk.Panedwindow(self.case_frame, orient="horizontal")
+        content.pack(fill="both", expand=True)
+
+        left_panel = ttk.Frame(content)
+        left_panel.columnconfigure(0, weight=1)
+        left_panel.rowconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(left_panel)
+        notebook.grid(row=0, column=0, sticky="nsew")
 
         self.history_tree = self._build_tree_tab(notebook, "Historia", ("Fecha", "Referencia"), ("fecha", "referencia"))
         self.liquidacion_tree = self._build_tree_tab(notebook, "Liquidacion", ("Fecha", "Referencia"), ("fecha", "referencia"))
@@ -176,15 +207,63 @@ class SitfaApp(tk.Tk):
             notebook,
             "Litigantes",
             ("Sujeto", "Rut/Pasaporte", "Nombre o Razon Social", "Fec. Nacimiento", "Edad"),
-            ("Sujeto", "Rut/Pasaporte", "Nombre o Razón Social", "Fec. Nacimiento", "Edad"),
+            ("Sujeto", "Rut/Pasaporte", "Nombre o Raz?n Social", "Fec. Nacimiento", "Edad"),
         )
         self.cons_lit_tree = self._build_tree_tab(
             notebook,
             "Cons. Lit.",
             ("RIT", "Fec. Ing.", "Fec. Ult. tramite", "Tribunal", "Materia(Termino)"),
-            ("RIT", "Fec. Ing.", "Fec. Últ. trámite", "Tribunal", "Materia(Término)"),
+            ("RIT", "Fec. Ing.", "Fec. ?lt. tr?mite", "Tribunal", "Materia(T?rmino)"),
         )
         self.log_text = self._build_log_tab(notebook, "Logs")
+
+        right_panel = ttk.Frame(content)
+        right_panel.columnconfigure(0, weight=1)
+        right_panel.rowconfigure(2, weight=1)
+
+        top_pdf_bar = ttk.Frame(right_panel)
+        top_pdf_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top_pdf_bar, text="Visor PDF", font=("Segoe UI", 13, "bold")).pack(side="left")
+        ttk.Label(top_pdf_bar, textvariable=self.pdf_status_var, foreground="#334155").pack(side="right")
+
+        zoom_bar = ttk.Frame(right_panel)
+        zoom_bar.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        ttk.Button(zoom_bar, text="-", width=3, command=lambda: self._change_pdf_zoom(-0.1)).pack(side="left")
+        ttk.Button(zoom_bar, text="+", width=3, command=lambda: self._change_pdf_zoom(0.1)).pack(side="left", padx=(6, 0))
+        ttk.Button(zoom_bar, text="Ajustar", command=self._fit_pdf_width).pack(side="left", padx=(10, 0))
+        ttk.Button(zoom_bar, text="100%", command=self._reset_pdf_zoom).pack(side="left", padx=(6, 0))
+        ttk.Label(zoom_bar, textvariable=self.pdf_zoom_var, foreground="#334155").pack(side="right")
+
+        self.pdf_canvas = tk.Canvas(right_panel, background="#111111", highlightthickness=0)
+        self.pdf_scrollbar = ttk.Scrollbar(right_panel, orient="vertical", command=self.pdf_canvas.yview)
+        self.pdf_canvas.configure(yscrollcommand=self.pdf_scrollbar.set)
+
+        self.pdf_inner_frame = ttk.Frame(self.pdf_canvas)
+        self._pdf_window = self.pdf_canvas.create_window((0, 0), window=self.pdf_inner_frame, anchor="nw")
+
+        self.pdf_inner_frame.bind("<Configure>", self._on_pdf_inner_configure)
+        self.pdf_canvas.bind("<Configure>", self._on_pdf_canvas_configure)
+        self.pdf_canvas.bind("<Enter>", self._bind_pdf_mousewheel)
+        self.pdf_canvas.bind("<Leave>", self._unbind_pdf_mousewheel)
+
+        self.pdf_canvas.grid(row=2, column=0, sticky="nsew")
+        self.pdf_scrollbar.grid(row=2, column=1, sticky="ns")
+
+        content.add(left_panel, weight=3)
+        content.add(right_panel, weight=2)
+
+        def _set_initial_split() -> None:
+            if not self.winfo_exists():
+                return
+            width = self.case_frame.winfo_width()
+            if width <= 1:
+                width = self.winfo_width()
+            if width <= 1:
+                self.after(80, _set_initial_split)
+                return
+            content.sashpos(0, max(460, int(width * 0.60)))
+
+        self.after(120, _set_initial_split)
 
         footer = ttk.Frame(self.case_frame)
         footer.pack(fill="x", pady=(12, 0))
@@ -209,6 +288,7 @@ class SitfaApp(tk.Tk):
         tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
+        tree.bind("<Double-1>", self._on_tree_double_click)
 
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
@@ -232,6 +312,145 @@ class SitfaApp(tk.Tk):
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
         return text
+
+    def _on_pdf_inner_configure(self, _event: tk.Event) -> None:
+        if self.pdf_canvas is None:
+            return
+        self.pdf_canvas.configure(scrollregion=self.pdf_canvas.bbox("all"))
+
+    def _on_pdf_canvas_configure(self, event: tk.Event) -> None:
+        if self.pdf_canvas is None:
+            return
+        if hasattr(self, "_pdf_window"):
+            self.pdf_canvas.itemconfigure(self._pdf_window, width=event.width)
+
+    def _bind_pdf_mousewheel(self, _event: tk.Event) -> None:
+        if self.pdf_canvas is None:
+            return
+        self.pdf_canvas.bind_all("<MouseWheel>", self._on_pdf_mousewheel)
+        self.pdf_canvas.bind_all("<Button-4>", self._on_pdf_mousewheel)
+        self.pdf_canvas.bind_all("<Button-5>", self._on_pdf_mousewheel)
+
+    def _unbind_pdf_mousewheel(self, _event: tk.Event) -> None:
+        if self.pdf_canvas is None:
+            return
+        self.pdf_canvas.unbind_all("<MouseWheel>")
+        self.pdf_canvas.unbind_all("<Button-4>")
+        self.pdf_canvas.unbind_all("<Button-5>")
+
+    def _on_pdf_mousewheel(self, event: tk.Event) -> None:
+        if self.pdf_canvas is None:
+            return
+        delta = getattr(event, "delta", 0)
+        if delta:
+            self.pdf_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+        elif getattr(event, "num", None) == 4:
+            self.pdf_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.pdf_canvas.yview_scroll(1, "units")
+
+    def _render_pdf(self, pdf_path: Path, scale: float | None = None) -> None:
+        if self.pdf_inner_frame is None:
+            return
+
+        pdf_path = pdf_path.resolve()
+        if not pdf_path.exists():
+            self.pdf_status_var.set("El PDF no existe")
+            return
+
+        self._clear_pdf_viewer()
+        self._current_pdf_path = str(pdf_path)
+
+        if scale is None:
+            scale = float(self.pdf_zoom_var.get() or 1.35)
+        self.pdf_zoom_var.set(round(scale, 2))
+        self.pdf_status_var.set(f"{pdf_path.name}  x{scale:.2f}")
+
+        images: list[ImageTk.PhotoImage] = []
+        try:
+            document = fitz.open(pdf_path)
+        except Exception as exc:
+            ttk.Label(self.pdf_inner_frame, text=f"No se pudo abrir el PDF: {exc}", padding=16).pack(anchor="w")
+            self._pdf_images = images
+            return
+
+        matrix = fitz.Matrix(scale, scale)
+        for page_number in range(document.page_count):
+            page = document.load_page(page_number)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+            photo = ImageTk.PhotoImage(image)
+            images.append(photo)
+
+            page_header = ttk.Label(self.pdf_inner_frame, text=f"Pagina {page_number + 1}", padding=(12, 12, 12, 4))
+            page_header.pack(anchor="w")
+
+            image_label = ttk.Label(self.pdf_inner_frame, image=photo)
+            image_label.pack(anchor="w", padx=12, pady=(0, 12))
+
+        self._pdf_images = images
+        try:
+            document.close()
+        except Exception:
+            pass
+
+    def _change_pdf_zoom(self, delta: float) -> None:
+        if self.pdf_inner_frame is None:
+            return
+        current = float(self.pdf_zoom_var.get() or 1.35)
+        new_scale = max(0.5, min(3.0, current + delta))
+        pdf_name = self.pdf_status_var.get().split("  x", 1)[0].strip()
+        current_path = getattr(self, "_current_pdf_path", None)
+        if current_path:
+            self._render_pdf(Path(current_path), new_scale)
+        else:
+            self.pdf_zoom_var.set(round(new_scale, 2))
+            self.pdf_status_var.set(f"{pdf_name}  x{new_scale:.2f}" if pdf_name and pdf_name != "Sin PDF cargado" else f"x{new_scale:.2f}")
+
+    def _reset_pdf_zoom(self) -> None:
+        current_path = getattr(self, "_current_pdf_path", None)
+        if current_path:
+            self._render_pdf(Path(current_path), 1.35)
+
+    def _fit_pdf_width(self) -> None:
+        current_path = getattr(self, "_current_pdf_path", None)
+        if current_path is None or self.pdf_canvas is None:
+            return
+        width = max(400, self.pdf_canvas.winfo_width() - 40)
+        scale = max(0.5, min(3.0, width / 900.0))
+        self._render_pdf(Path(current_path), scale)
+
+    def _clear_pdf_viewer(self) -> None:
+        if self.pdf_inner_frame is None:
+            return
+        current_path = getattr(self, "_current_pdf_path", None)
+        for child in list(self.pdf_inner_frame.winfo_children()):
+            child.destroy()
+        self._pdf_images = []
+        self.pdf_status_var.set("Sin PDF cargado")
+        self._current_pdf_path = None
+        if self.pdf_canvas is not None:
+            self.pdf_canvas.yview_moveto(0)
+        self._delete_pdf_file(current_path)
+
+    def _delete_pdf_file(self, path_value: str | None) -> None:
+        if not path_value:
+            return
+        try:
+            path = Path(path_value)
+        except Exception:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _display_pdf(self, pdf_path: Path) -> None:
+        previous_path = getattr(self, "_current_pdf_path", None)
+        resolved_pdf = str(pdf_path.resolve())
+        if previous_path and previous_path != resolved_pdf:
+            self._delete_pdf_file(previous_path)
+        self._render_pdf(pdf_path, float(self.pdf_zoom_var.get() or 1.35))
 
     def _set_busy(self, busy: bool, message: str) -> None:
         self._busy = busy
@@ -269,6 +488,7 @@ class SitfaApp(tk.Tk):
             messagebox.showerror("Consulta", "Debe ingresar un RIT.")
             return
         self._clear_result_trees()
+        self._clear_pdf_viewer()
         self._set_busy(True, f"Consultando causa {rit}...")
         self._append_log(f"Solicitud de consulta enviada para {rit}.")
         self._worker.submit("consult", {"rit": rit})
@@ -279,6 +499,7 @@ class SitfaApp(tk.Tk):
         self.rit_var.set("")
         self.case_var.set("Sin causa consultada")
         self._clear_result_trees()
+        self._clear_pdf_viewer()
         self.status_var.set("Ingrese un nuevo RIT para consultar otra causa.")
         self.rit_entry.focus_set()
 
@@ -292,32 +513,37 @@ class SitfaApp(tk.Tk):
         ):
             for item in tree.get_children():
                 tree.delete(item)
+        self._section_rows.clear()
+        self._clear_pdf_viewer()
 
-    def _fill_tree(self, tree: ttk.Treeview, rows: list[dict], keys: tuple[str, ...]) -> None:
+    def _fill_tree(self, tree: ttk.Treeview, rows: list[dict], keys: tuple[str, ...], section: str) -> None:
         for item in tree.get_children():
             tree.delete(item)
-        for row in rows:
+        for index, row in enumerate(rows, start=1):
             values = [row.get(key, "") for key in keys]
-            tree.insert("", "end", values=values)
+            tree.insert("", "end", iid=str(index), values=values)
+        self._section_rows[section] = rows
 
     def _fill_section(self, section: str, rows: list[dict]) -> None:
         if section == "historia":
-            self._fill_tree(self.history_tree, rows, ("fecha", "referencia"))
+            self._fill_tree(self.history_tree, rows, ("fecha", "referencia"), section)
         elif section == "liquidacion":
-            self._fill_tree(self.liquidacion_tree, rows, ("fecha", "referencia"))
+            self._fill_tree(self.liquidacion_tree, rows, ("fecha", "referencia"), section)
         elif section == "escritos":
-            self._fill_tree(self.escritos_tree, rows, ("fecha", "referencia"))
+            self._fill_tree(self.escritos_tree, rows, ("fecha", "referencia"), section)
         elif section == "litigantes":
             self._fill_tree(
                 self.litigantes_tree,
                 rows,
                 ("Sujeto", "Rut/Pasaporte", "Nombre o Razón Social", "Fec. Nacimiento", "Edad"),
+                section,
             )
         elif section == "cons_lit":
             self._fill_tree(
                 self.cons_lit_tree,
                 rows,
                 ("RIT", "Fec. Ing.", "Fec. Últ. trámite", "Tribunal", "Materia(Término)"),
+                section,
             )
 
     def _append_log(self, message: str) -> None:
@@ -373,6 +599,12 @@ class SitfaApp(tk.Tk):
             self._set_busy(False, f"Consulta terminada para {rit}.")
             return
 
+        if event == "pdf_opened":
+            pdf_path = Path(payload.get("path", ""))
+            self._display_pdf(pdf_path)
+            self._set_busy(False, f"PDF abierto: {pdf_path.name}")
+            return
+
         if event == "log":
             self._append_log(payload.get("message", ""))
             return
@@ -386,10 +618,63 @@ class SitfaApp(tk.Tk):
         if event == "shutdown_complete":
             self.destroy()
 
+    def _get_row_for_tree_item(self, tree: ttk.Treeview, item_id: str) -> dict | None:
+        if tree is self.history_tree:
+            section = "historia"
+        elif tree is self.liquidacion_tree:
+            section = "liquidacion"
+        elif tree is self.escritos_tree:
+            section = "escritos"
+        else:
+            return None
+
+        try:
+            index = int(item_id) - 1
+        except ValueError:
+            return None
+
+        rows = self._section_rows.get(section, [])
+        if 0 <= index < len(rows):
+            return rows[index]
+        return None
+
+    def _on_tree_double_click(self, event: tk.Event) -> None:
+        if self._busy:
+            return
+
+        tree = event.widget
+        if tree not in (self.history_tree, self.liquidacion_tree, self.escritos_tree):
+            return
+
+        selection = tree.selection()
+        if not selection:
+            return
+
+        row = self._get_row_for_tree_item(tree, selection[0])
+        if not row:
+            return
+
+        pdf_url = (row.get("pdf_url") or "").strip()
+        if not pdf_url:
+            messagebox.showinfo("PDF", "La fila seleccionada no tiene PDF asociado.")
+            return
+
+        if tree is self.history_tree:
+            prefix = "historia"
+        elif tree is self.liquidacion_tree:
+            prefix = "liquidacion"
+        else:
+            prefix = "escritos"
+
+        self._set_busy(True, "Abriendo PDF...")
+        self._append_log(f"Solicitud para abrir PDF de {prefix}.")
+        self._worker.submit("open_pdf", {"pdf_url": pdf_url, "prefix": prefix})
+
     def _on_close(self) -> None:
         if self._busy:
             if not messagebox.askyesno("Salir", "Hay una operacion en curso. Desea cerrar igualmente?"):
                 return
+        self._clear_pdf_viewer()
         self._worker.submit("shutdown")
 
 

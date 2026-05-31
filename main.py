@@ -17,8 +17,9 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 import unicodedata
 
+import fitz
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
@@ -709,28 +710,37 @@ def parse_runtime_options() -> tuple[str, bool]:
         "--browser",
         choices=("ie", "edge"),
         default=None,
-        help="Browser mode to use. Defaults to IE unless headless is enabled.",
+        help="Browser mode to use. Defaults to Edge.",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        default=os.getenv("SITFA_HEADLESS", "0").strip() == "1",
+        default=False,
         help="Run the browser without a visible window.",
+    )
+    parser.add_argument(
+        "--visible",
+        action="store_true",
+        default=False,
+        help="Force a visible browser window.",
     )
     args = parser.parse_args()
 
     browser = args.browser or os.getenv("SITFA_BROWSER", "").strip().lower()
     if not browser:
-        browser = "edge" if args.headless else "ie"
+        browser = "edge"
 
-    if args.headless and browser == "ie":
-        raise ValueError("El modo no visible requiere --browser edge o SITFA_BROWSER=edge.")
+    env_headless = os.getenv("SITFA_HEADLESS")
+    default_headless = True if env_headless is None else env_headless.strip() == "1"
+    headless = default_headless or args.headless
+    if args.visible:
+        headless = False
 
-    return browser, args.headless
+    return browser, headless
 
 
-def create_driver(initial_url: str | None = None, browser: str = "ie", headless: bool = False):
-    browser = (browser or "ie").strip().lower()
+def create_driver(initial_url: str | None = None, browser: str = "edge", headless: bool = False):
+    browser = (browser or "edge").strip().lower()
     page_load_strategy = os.getenv("SITFA_PAGE_LOAD_STRATEGY", "eager")
 
     if browser == "edge":
@@ -1407,33 +1417,146 @@ def prompt_escritos_resolver_row_to_open(driver, resolver_rows: list[dict]) -> N
         print(f"PDF descargado y abierto: {downloaded_path}")
 
 
-def open_litigantes_popup(driver, log_callback: LogCallback | None = None) -> str:
+def resolve_litigantes_popup_url(driver, log_callback: LogCallback | None = None) -> str:
     driver.switch_to.default_content()
     try:
         step_start = time.perf_counter()
-        actions = get_clickable_actions(driver, verbose=False)
-        emit_log(log_callback, f"Litigantes detalle: acciones leidas en {time.perf_counter() - step_start:.1f}s")
+        frames = [None] + driver.find_elements(By.TAG_NAME, "frame") + driver.find_elements(By.TAG_NAME, "iframe")
+        emit_log(log_callback, f"Litigantes cabecera: buscando popup en {len(frames) - 1} frame(s)")
+
+        for frame in frames:
+            driver.switch_to.default_content()
+            if frame is not None:
+                try:
+                    driver.switch_to.frame(frame)
+                except WebDriverException:
+                    continue
+
+            try:
+                popup_url = driver.execute_script(
+                    """
+                    var capturedUrl = "";
+                    if (typeof ShowPopUpCabecera !== "function") {
+                        return "";
+                    }
+                    var originalDialog = window.showModalDialog;
+                    try {
+                        window.showModalDialog = function(url) {
+                            capturedUrl = String(url || "");
+                            return null;
+                        };
+                        ShowPopUpCabecera(5);
+                    } finally {
+                        window.showModalDialog = originalDialog;
+                    }
+                    return capturedUrl;
+                    """
+                )
+            except WebDriverException:
+                popup_url = ""
+
+            popup_url = str(popup_url or "").strip()
+            if popup_url:
+                emit_log(log_callback, f"Litigantes cabecera: popup capturado en {time.perf_counter() - step_start:.1f}s")
+                driver.switch_to.default_content()
+                return popup_url
 
         step_start = time.perf_counter()
-        action = find_action_by_label(actions, ("datos litigantes", "litigantes"))
-        emit_log(log_callback, f"Litigantes detalle: accion localizada en {time.perf_counter() - step_start:.1f}s")
+        actions = get_clickable_actions(driver, verbose=False)
+        emit_log(log_callback, f"Litigantes cabecera: acciones leidas en {time.perf_counter() - step_start:.1f}s")
+
+        step_start = time.perf_counter()
+        action = next(
+            (
+                item
+                for item in actions
+                if "showpopupcabecera(5)" in (item.get("onclick") or "").lower()
+                or ((item.get("label") or "").strip().lower() == "litigantes" and item.get("kind") == "button")
+            ),
+            None,
+        )
+        if action is None:
+            action = find_action_by_label(actions, ("litigantes",))
+        emit_log(log_callback, f"Litigantes cabecera: accion localizada en {time.perf_counter() - step_start:.1f}s")
         if action:
-            click_action(driver, action, verbose=False, log_callback=log_callback, log_prefix="Litigantes detalle")
+            click_action(driver, action, verbose=False, log_callback=log_callback, log_prefix="Litigantes cabecera")
             clicked = True
         else:
             clicked = False
     except WebDriverException as exc:
-        raise RuntimeError(f"No se pudo invocar ShowLitigantes: {exc}") from exc
+        raise RuntimeError(f"No se pudo invocar ShowPopUpCabecera(5): {exc}") from exc
 
     if not clicked:
         raise RuntimeError("No encontre el boton o funcion de Litigantes.")
-    try:
-        return driver.current_window_handle
-    except WebDriverException:
-        return ""
+    driver.switch_to.default_content()
+    return ""
 
 
-def fetch_litigantes_popup_html(driver, log_callback: LogCallback | None = None) -> str:
+def fetch_litigantes_popup_html(
+    driver,
+    popup_url: str = "",
+    log_callback: LogCallback | None = None,
+) -> str:
+    if popup_url:
+        try:
+            content_type, popup_bytes = fetch_session_resource_bytes(driver, popup_url)
+            if "pdf" in (content_type or "").lower() or popup_bytes.startswith(b"%PDF"):
+                try:
+                    pdf_doc = fitz.open(stream=popup_bytes, filetype="pdf")
+                    pdf_text = "\n".join(page.get_text("text") for page in pdf_doc)
+                except Exception as exc:
+                    emit_log(log_callback, f"Litigantes: error leyendo PDF directo {popup_url}: {exc}")
+                    pdf_text = popup_bytes.decode("latin-1", errors="replace")
+                popup_rows = extract_litigantes_rows_from_pdf_text(pdf_text)
+                if popup_rows:
+                    emit_log(
+                        log_callback,
+                        f"Litigantes: descarga directa PDF con {len(popup_rows)} filas (tipo={content_type or 'desconocido'})",
+                    )
+                    return pdf_text
+                emit_log(
+                    log_callback,
+                    f"Litigantes: PDF directo sin filas, tipo={content_type or 'desconocido'}, len={len(pdf_text)}",
+                )
+                popup_html = pdf_text
+            else:
+                popup_html = popup_bytes.decode("utf-8", errors="replace")
+                popup_rows = extract_litigantes_rows_from_html(popup_html)
+            if popup_rows:
+                emit_log(
+                    log_callback,
+                    f"Litigantes: descarga directa con {len(popup_rows)} filas (tipo={content_type or 'desconocido'})",
+                )
+                return popup_html
+            emit_log(
+                log_callback,
+                f"Litigantes: descarga directa sin filas, tipo={content_type or 'desconocido'}, len={len(popup_html)}",
+            )
+            frame_src = extract_popup_frame_src(popup_html)
+            if frame_src:
+                try:
+                    _, frame_html = fetch_session_resource_text(driver, frame_src)
+                    frame_rows = extract_litigantes_rows_from_html(frame_html)
+                    if frame_rows:
+                        emit_log(log_callback, f"Litigantes: descarga directa frame_src con {len(frame_rows)} filas")
+                        return frame_html
+                    emit_log(log_callback, "Litigantes: descarga directa frame_src encontrado pero no extrajo filas")
+                    popup_html = frame_html
+                except Exception as exc:
+                    emit_log(log_callback, f"Litigantes: error descargando frame_src {frame_src}: {exc}")
+
+            try:
+                outer_rows = extract_litigantes_rows_from_html(popup_html)
+                if outer_rows:
+                    emit_log(log_callback, f"Litigantes: descarga directa outerHTML con {len(outer_rows)} filas")
+                    return popup_html
+            except Exception:
+                pass
+
+            return popup_html
+        except Exception as exc:
+            emit_log(log_callback, f"Litigantes: error descargando URL {popup_url}: {exc}")
+
     popup_html = driver.page_source or ""
     if popup_html:
         popup_rows = extract_litigantes_rows_from_html(popup_html)
@@ -1522,13 +1645,13 @@ def collect_litigantes_rows(driver) -> list[dict]:
         pass
 
     try:
-        popup_handle = open_litigantes_popup(driver, log_callback=log_callback)
-        if not popup_handle:
+        popup_url = resolve_litigantes_popup_url(driver)
+        if not popup_url:
             return []
-        frame_html = fetch_litigantes_popup_html(driver, log_callback=log_callback)
+        frame_html = fetch_litigantes_popup_html(driver, popup_url)
         rows = extract_litigantes_rows_from_html(frame_html)
         if not rows:
-            rows = extract_litigantes_rows_from_dom(driver, log_callback=log_callback)
+            rows = extract_litigantes_rows_from_dom(driver)
         return rows
     finally:
         restore_primary_window(driver, original_handle)
@@ -1542,11 +1665,16 @@ def collect_cons_lit_rows(driver, subject_label: str = "DDO.") -> list[dict]:
         pass
 
     try:
-        popup_handle = open_litigantes_popup(driver)
-        if not popup_handle:
+        popup_url = resolve_litigantes_popup_url(driver)
+        if not popup_url:
             return []
-        frame_html = fetch_litigantes_popup_html(driver)
-        cons_lit_url, _ = open_cons_lit_popup_from_litigantes(driver, subject_label=subject_label)
+        frame_html = fetch_litigantes_popup_html(driver, popup_url)
+        cons_lit_url, _ = open_cons_lit_popup_from_litigantes(
+            driver,
+            subject_label=subject_label,
+            litigantes_popup_url=popup_url,
+            log_callback=None,
+        )
         if not cons_lit_url:
             return []
         _, cons_lit_popup_html = fetch_session_resource_text(driver, cons_lit_url)
@@ -1575,13 +1703,13 @@ def collect_litigantes_and_cons_lit_rows(
 
     try:
         step_start = time.perf_counter()
-        popup_handle = open_litigantes_popup(driver, log_callback=log_callback)
-        emit_log(log_callback, f"Litigantes: popup abierto en {time.perf_counter() - step_start:.1f}s")
-        if not popup_handle:
+        popup_url = resolve_litigantes_popup_url(driver, log_callback=log_callback)
+        emit_log(log_callback, f"Litigantes: popup de cabecera resuelto en {time.perf_counter() - step_start:.1f}s")
+        if not popup_url:
             return litigantes_rows, cons_lit_rows
 
         step_start = time.perf_counter()
-        frame_html = fetch_litigantes_popup_html(driver, log_callback=log_callback)
+        frame_html = fetch_litigantes_popup_html(driver, popup_url, log_callback=log_callback)
         litigantes_rows = extract_litigantes_rows_from_html(frame_html)
         if not litigantes_rows:
             litigantes_rows = extract_litigantes_rows_from_dom(driver, log_callback=log_callback)
@@ -1602,7 +1730,12 @@ def collect_litigantes_and_cons_lit_rows(
             )
 
         step_start = time.perf_counter()
-        cons_lit_url, cons_lit_reason = open_cons_lit_popup_from_litigantes(driver, subject_label=subject_label)
+        cons_lit_url, cons_lit_reason = open_cons_lit_popup_from_litigantes(
+            driver,
+            subject_label=subject_label,
+            litigantes_popup_url=popup_url,
+            log_callback=log_callback,
+        )
         if not cons_lit_url:
             if cons_lit_reason:
                 emit_log(log_callback, f"Cons. Lit.: no disponible ({cons_lit_reason})")
@@ -1610,7 +1743,7 @@ def collect_litigantes_and_cons_lit_rows(
         emit_log(log_callback, f"Cons. Lit.: URL obtenida en {time.perf_counter() - step_start:.1f}s")
 
         step_start = time.perf_counter()
-        _, cons_lit_popup_html = fetch_session_resource_text(driver, cons_lit_url)
+        cons_content_type, cons_lit_popup_html = fetch_session_resource_text(driver, cons_lit_url)
         cons_lit_frame_src = extract_popup_frame_src(cons_lit_popup_html)
         cons_lit_html = cons_lit_popup_html
         if cons_lit_frame_src:
@@ -1618,8 +1751,10 @@ def collect_litigantes_and_cons_lit_rows(
         cons_lit_rows = extract_cons_lit_rows_from_html(cons_lit_html)
         emit_log(
             log_callback,
-            f"Cons. Lit.: HTML leido y {len(cons_lit_rows)} filas extraidas en {time.perf_counter() - step_start:.1f}s",
+            f"Cons. Lit.: HTML leido y {len(cons_lit_rows)} filas extraidas en {time.perf_counter() - step_start:.1f}s "
+            f"(tipo={cons_content_type or 'desconocido'}, len={len(cons_lit_popup_html)})",
         )
+        log_cons_lit_rows(log_callback, cons_lit_rows)
         return litigantes_rows, cons_lit_rows
     finally:
         restore_primary_window(driver, original_handle)
@@ -1638,19 +1773,19 @@ def describe_litigantes_popup(driver) -> None:
     except WebDriverException:
         original_handle = ""
     try:
-        popup_handle = open_litigantes_popup(driver)
+        popup_url = resolve_litigantes_popup_url(driver)
     except Exception as exc:
         print(f"No se pudo abrir Litigantes: {exc}")
         return
 
-    if not popup_handle:
-        print("No se detecto la ventana de Litigantes.")
+    if not popup_url:
+        print("No se detecto el enlace de Litigantes.")
         return
 
     try:
         try:
-            popup_html = driver.page_source or ""
-        except WebDriverException as exc:
+            _, popup_html = fetch_session_resource_text(driver, popup_url)
+        except Exception as exc:
             print(f"No se pudo leer Litigantes: {exc}")
             return
 
@@ -1665,7 +1800,12 @@ def describe_litigantes_popup(driver) -> None:
             frame_html = popup_html
 
         printed_rows = print_litigantes_table_from_html(frame_html)
-        cons_lit_url, cons_lit_reason = open_cons_lit_popup_from_litigantes(driver, subject_label="DDO.")
+        cons_lit_url, cons_lit_reason = open_cons_lit_popup_from_litigantes(
+            driver,
+            subject_label="DDO.",
+            litigantes_popup_url=popup_url,
+            log_callback=log_callback,
+        )
         if cons_lit_url:
             try:
                 _, cons_lit_popup_html = fetch_session_resource_text(driver, cons_lit_url)
@@ -1694,9 +1834,6 @@ def login_to_sitfa(driver, username: str, password: str, log_callback: LogCallba
     wait_for_ready(driver, timeout=10)
     emit_log(log_callback, "Login: enviando credenciales")
     submit_login(driver, username, password)
-    wait_for_ready(driver, timeout=30)
-    emit_log(log_callback, "Login: navegando al menú de consulta")
-    safe_get(driver, POST_LOGIN_URL, timeout=30)
     wait_for_ready(driver, timeout=30)
     emit_log(log_callback, f"Login completado en {time.perf_counter() - start:.1f}s")
 
@@ -2259,6 +2396,19 @@ def fetch_session_resource_text(driver, resource_url: str) -> tuple[str, str]:
             pass
 
 
+def fetch_session_resource_bytes(driver, resource_url: str) -> tuple[str, bytes]:
+    with tempfile.NamedTemporaryFile(prefix="sitfa_", suffix=".bin", delete=False) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    try:
+        return download_session_resource(driver, resource_url, temp_path)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class TableSourceParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -2357,6 +2507,88 @@ def normalize_litigantes_value(value: str) -> str:
     value = value.replace("\ufffd", "")
     value = re.sub(r"\bvar\s+[a-zA-Z_]\w*\s*=.*$", "", value).strip(" ;,|-")
     return value
+
+
+def extract_litigantes_rows_from_pdf_text(source: str) -> list[dict]:
+    if not source:
+        return []
+
+    lines = [normalize_litigantes_value(line) for line in source.splitlines()]
+    lines = [line for line in lines if line and line != "%PDF-1.4"]
+    if not any(line.lower().startswith("litigante:") for line in lines):
+        return []
+
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+
+    def flush_current() -> None:
+        nonlocal current
+        if current:
+            records.append(current)
+            current = {}
+
+    for line in lines:
+        normalized = line.lower()
+        if normalized.startswith("datos litigante"):
+            continue
+        if set(line) == {"_"}:
+            flush_current()
+            continue
+        if ":" not in line:
+            continue
+
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        value = raw_value.strip()
+        key_norm = normalize_header_name(key)
+
+        if key_norm == normalize_header_name("Litigante"):
+            if current:
+                flush_current()
+            current["Sujeto"] = value
+            continue
+
+        if key_norm == normalize_header_name("Nombre"):
+            current["Nombre o Razón Social"] = value
+        elif key_norm == normalize_header_name("RUT"):
+            current["Rut/Pasaporte"] = value
+        elif key_norm == normalize_header_name("Fecha de Nacimiento"):
+            current["Fec. Nacimiento"] = value
+        elif key_norm == normalize_header_name("Dirección"):
+            current.setdefault("Direccion", value)
+        elif key_norm == normalize_header_name("Correo Electrónico"):
+            current.setdefault("Correo Electrónico", value)
+
+    flush_current()
+
+    result_rows: list[dict] = []
+    today = datetime.now().date()
+    for record in records:
+        subject = normalize_litigantes_value(record.get("Sujeto", ""))
+        rut = normalize_litigantes_value(record.get("Rut/Pasaporte", ""))
+        name = normalize_litigantes_value(record.get("Nombre o Razón Social", ""))
+        birth = normalize_litigantes_value(record.get("Fec. Nacimiento", ""))
+        age = ""
+        try:
+            birth_date = datetime.strptime(birth, "%d/%m/%Y").date()
+            age = str(today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day)))
+        except Exception:
+            age = ""
+
+        if not rut and not name:
+            continue
+
+        result_rows.append(
+            {
+                "Sujeto": subject,
+                "Rut/Pasaporte": rut,
+                "Nombre o Razón Social": name,
+                "Fec. Nacimiento": birth,
+                "Edad": age,
+            }
+        )
+
+    return result_rows
 
 
 def extract_litigantes_rows_from_table(table: dict, wanted_headers: list[str]) -> list[dict]:
@@ -2491,6 +2723,12 @@ def extract_litigantes_rows_from_html(source: str) -> list[dict]:
         table_rows = extract_litigantes_rows_from_table(table, wanted_headers)
         if len(table_rows) > len(best_rows):
             best_rows = table_rows
+    if best_rows:
+        return best_rows
+
+    text_rows = extract_litigantes_rows_from_pdf_text(source)
+    if text_rows:
+        return text_rows
     return best_rows
 
 
@@ -2649,6 +2887,24 @@ def print_cons_lit_table_from_html(source: str) -> bool:
     return printed > 0
 
 
+def log_cons_lit_rows(log_callback: LogCallback | None, rows: list[dict]) -> None:
+    if not rows:
+        emit_log(log_callback, "Cons. Lit.: sin filas para mostrar")
+        return
+
+    emit_log(log_callback, f"Cons. Lit.: mostrando {len(rows)} filas")
+    for index, row in enumerate(rows, start=1):
+        rit = normalize_litigantes_value(row.get("RIT", ""))
+        fec_ing = normalize_litigantes_value(row.get("Fec. Ing.", ""))
+        fec_ult = normalize_litigantes_value(row.get("Fec. Ãšlt. trÃ¡mite", ""))
+        tribunal = normalize_litigantes_value(row.get("Tribunal", ""))
+        materia = normalize_litigantes_value(row.get("Materia(TÃ©rmino)", ""))
+        emit_log(
+            log_callback,
+            f"Cons. Lit. {index}: {rit} | {fec_ing} | {fec_ult} | {tribunal} | {materia}",
+        )
+
+
 def restore_primary_window(driver, original_handle: str) -> None:
     try:
         handles = list(driver.window_handles)
@@ -2713,202 +2969,321 @@ def dump_popup_html_from_url(driver, prefix: str, popup_url: str) -> Path:
     return dump_dir
 
 
-def open_cons_lit_popup_from_litigantes(driver, subject_label: str = "DDO.") -> tuple[str | None, str]:
-    driver.switch_to.default_content()
+def open_cons_lit_popup_from_litigantes(
+    driver,
+    subject_label: str = "DDO.",
+    litigantes_popup_url: str = "",
+    log_callback: LogCallback | None = None,
+) -> tuple[str | None, str]:
+    original_handle = ""
+    opened_temp_handle = ""
+    try:
+        original_handle = driver.current_window_handle
+    except WebDriverException:
+        original_handle = ""
 
-    frames = driver.find_elements(By.TAG_NAME, "frame") + driver.find_elements(By.TAG_NAME, "iframe")
-    frame_candidates = [None] + frames
-    last_reason = ""
-
-    for frame in frame_candidates:
-        driver.switch_to.default_content()
-        if frame:
+    try:
+        if litigantes_popup_url:
             try:
-                driver.switch_to.frame(frame)
+                resolved_url = litigantes_popup_url
+                try:
+                    _, wrapper_html = fetch_session_resource_text(driver, litigantes_popup_url)
+                    wrapper_frame_src = extract_popup_frame_src(wrapper_html)
+                    if wrapper_frame_src:
+                        resolved_url = wrapper_frame_src
+                        emit_log(log_callback, f"Litigantes cons: frame_src resuelto para popup {resolved_url}")
+                except Exception as exc:
+                    emit_log(log_callback, f"Litigantes cons: no se pudo resolver frame_src: {exc}")
+
+                before_handles = set(driver.window_handles)
+                driver.execute_script("window.open(arguments[0], '_blank');", resolved_url)
+                wait_start = time.perf_counter()
+                while time.perf_counter() - wait_start < 10:
+                    current_handles = set(driver.window_handles)
+                    new_handles = list(current_handles - before_handles)
+                    if new_handles:
+                        opened_temp_handle = new_handles[0]
+                        break
+                    time.sleep(0.2)
+                if not opened_temp_handle:
+                    raise RuntimeError("No se pudo abrir una ventana nueva para Litigantes")
+                driver.switch_to.window(opened_temp_handle)
+                wait_for_ready(driver, timeout=10)
+                emit_log(log_callback, "Litigantes cons: popup de litigantes abierto en ventana temporal")
+                scope_results = wait_for_window_scopes_content(driver, timeout=8.0)
+                scope_summary = [
+                    f"{scope.get('frame_index')}:{(scope.get('frame_name') or '').strip()} "
+                    f"text_has_ddo={'DDO.' in ((scope.get('text') or '') + ' ' + (scope.get('html') or '')).upper()}"
+                    for scope in scope_results
+                ]
+                emit_log(log_callback, f"Litigantes cons: scopes={scope_summary}")
+            except Exception as exc:
+                emit_log(log_callback, f"Litigantes cons: no se pudo abrir popup temporal: {exc}")
+                if opened_temp_handle:
+                    try:
+                        driver.close()
+                    except WebDriverException:
+                        pass
+                if original_handle:
+                    try:
+                        driver.switch_to.window(original_handle)
+                    except WebDriverException:
+                        pass
+                return None, "popup_open_failed"
+
+        target_row = None
+        candidate_count = 0
+        sample_labels: list[str] = []
+        try:
+            rows = []
+            scope_results = wait_for_window_scopes_content(driver, timeout=4.0)
+            target_scope = None
+            for scope in scope_results:
+                scope_text = f"{scope.get('text') or ''}\n{scope.get('html') or ''}".upper()
+                if "DDO." in scope_text:
+                    target_scope = scope
+                    break
+
+            if target_scope and target_scope.get("frame_path"):
+                frame_path = [int(part) for part in target_scope.get("frame_path") or []]
+                if frame_path and switch_to_frame_path(driver, frame_path):
+                    rows = driver.find_elements(By.TAG_NAME, "tr")
+            if not rows:
+                rows = driver.find_elements(By.TAG_NAME, "tr")
+        except WebDriverException as exc:
+            emit_log(log_callback, f"Litigantes cons: no se pudieron leer filas: {exc}")
+            return None, "row_read_failed"
+
+        for row in rows:
+            try:
+                row_text = str(row.text or row.get_attribute("innerText") or row.get_attribute("textContent") or "")
+                row_text = " ".join(row_text.replace("\xa0", " ").split()).upper()
             except WebDriverException:
                 continue
+            if "DDO." not in row_text:
+                continue
+            candidate_count += 1
+            if len(sample_labels) < 5:
+                sample_labels.append(row_text)
+            target_row = row
+            break
 
-        result = driver.execute_script(
-        """
-        function normalizeText(value) {
-            value = String(value || '');
-            value = value.replace(/\\s+/g, ' ');
-            value = value.replace(/^\\s+|\\s+$/g, '');
-            return value.toUpperCase();
-        }
-        var targetLabel = normalizeText(arguments[0] || '');
-        var rows = document.getElementsByTagName('tr');
-        var targetRow = null;
-        for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-            var row = rows[rowIndex];
-            var onclickAttr = String(row.getAttribute('onclick') || '');
-            if (onclickAttr.indexOf('SelectItem') < 0) {
-                var boundCell = row.querySelector('td[onclick], td a[onclick], td a[href*="SelectItem"]');
-                onclickAttr = boundCell ? String(boundCell.getAttribute('onclick') || '') : '';
-            }
-            if (onclickAttr.indexOf('SelectItem') < 0) {
-                continue;
-            }
-            var cells = row.getElementsByTagName('td');
-            if (!cells || cells.length < 1) {
-                continue;
-            }
-            var rawLabel = '';
-            for (var ci = 0; ci < Math.min(cells.length, 2); ci++) {
-                rawLabel = String(cells[ci].innerText || cells[ci].textContent || '').trim();
-                if (rawLabel) {
-                    break;
+        emit_log(
+            log_callback,
+            f"Litigantes cons: busqueda DDO. candidates={candidate_count} samples={sample_labels}",
+        )
+
+        if target_row is None:
+            return None, "row_not_found"
+
+        try:
+            driver.execute_script(
+                """
+                var row = arguments[0];
+                if (row) {
+                    if (typeof row.scrollIntoView === 'function') {
+                        row.scrollIntoView({block: 'center', inline: 'nearest'});
+                    }
+                    if (typeof row.click === 'function') {
+                        row.click();
+                    } else {
+                        row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    }
                 }
-            }
-            if (!rawLabel) {
-                continue;
-            }
-            var label = normalizeText(rawLabel);
-            if (targetLabel && label.indexOf(targetLabel) >= 0) {
-                targetRow = row;
-                break;
-            }
-        }
-        if (!targetRow) {
-            return { ok: false, reason: 'row_not_found' };
-        }
-        if (typeof targetRow.onclick === 'function') {
-            targetRow.onclick();
-        } else {
-            targetRow.click();
-        }
-        var button = document.getElementById('consLitigante');
-        if (!button) {
-            return { ok: false, reason: 'button_not_found' };
-        }
-        if (button.disabled) {
-            return {
-                ok: false,
-                reason: 'button_disabled',
-                rut: String(window.rut || ''),
-                dv: String(window.dv || ''),
-                crr_idparte: String(window.crr_idparte || ''),
-                cod_litigante: String(window.COD_Litigante || ''),
-                tip_ident: String(window.TIP_Ident || ''),
-                pasaporte: String(window.Pasaporte || '')
-            };
-        }
-        var showPopUpSource = typeof ShowPopUp === 'function' ? String(ShowPopUp) : '';
-        var causeMatch = showPopUpSource.match(/CRR_IdCausa=([0-9]+)/);
-        var causeId = causeMatch ? causeMatch[1] : '';
-        if (!causeId) {
-            return { ok: false, reason: 'cause_not_found' };
-        }
-        var rut = String(window.rut || '');
-        var dv = String(window.dv || '');
-        var crrIdParte = String(window.crr_idparte || '');
-        var codLitigante = String(window.COD_Litigante || '');
-        var tipIdent = String(window.TIP_Ident || '');
-        var pasaporte = String(window.Pasaporte || '');
-        if (!rut || !dv || !crrIdParte || !codLitigante) {
-            return {
-                ok: false,
-                reason: 'globals_missing',
-                rut: rut,
-                dv: dv,
-                crr_idparte: crrIdParte,
-                cod_litigante: codLitigante,
-                tip_ident: tipIdent,
-                pasaporte: pasaporte
-            };
-        }
-        var url =
-            '/SITFAWEB/jsp/Ingreso/PopUp/PopUpPpalB4.jsp' +
-            '?COD_Litigante=' + encodeURIComponent(codLitigante) +
-            '&CRR_IdCausa=' + encodeURIComponent(causeId) +
-            '&CRR_IdParte=' + encodeURIComponent(crrIdParte) +
-            '&COD_Modulo=2' +
-            '&tipo_popUp=21' +
-            '&RUT_Litigante=' + encodeURIComponent(rut) +
-            '&RUT_DV=' + encodeURIComponent(dv) +
-            '&TIP_Identificacion=' + encodeURIComponent(tipIdent) +
-            '&IDF_Extranjero=' + encodeURIComponent(pasaporte) +
-            '&formaInicio=1' +
-            '&HeightIfrmae=600';
-        return {
-            ok: true,
-            url: url
-        };
-        """,
-        subject_label,
-    )
-        driver.switch_to.default_content()
+                """,
+                target_row,
+            )
+            emit_log(log_callback, "Litigantes cons: click sobre DDO. ejecutado")
+        except WebDriverException as exc:
+            emit_log(log_callback, f"Litigantes cons: fallo al clickear DDO.: {exc}")
+            return None, "row_click_failed"
 
-        if not result or not result.get("ok"):
-            reason = ""
-            if isinstance(result, dict):
-                reason = str(result.get("reason") or "")
-            if reason:
-                if reason != "row_not_found":
-                    return None, reason
-                last_reason = reason
-            continue
+        button = None
+        button_candidates = []
+        try:
+            button_candidates = driver.execute_script(
+                """
+                function normalize(value) {
+                    return String(value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                }
+                var target = 'CONS. LIT.';
+                var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
+                var matches = [];
+                for (var i = 0; i < elements.length; i++) {
+                    var el = elements[i];
+                    var text = normalize(el.innerText || el.textContent || el.value || '');
+                    var attrs = normalize(
+                        (el.getAttribute('id') || '') + ' ' +
+                        (el.getAttribute('name') || '') + ' ' +
+                        (el.getAttribute('title') || '') + ' ' +
+                        (el.getAttribute('aria-label') || '') + ' ' +
+                        (el.getAttribute('value') || '')
+                    );
+                    var visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    if (visible && (text.indexOf(target) >= 0 || attrs.indexOf(target) >= 0)) {
+                        matches.push({
+                            tag: el.tagName,
+                            id: el.id || '',
+                            name: el.getAttribute('name') || '',
+                            value: el.getAttribute('value') || '',
+                            text: (el.innerText || el.textContent || '').trim(),
+                            title: el.getAttribute('title') || '',
+                            aria: el.getAttribute('aria-label') || ''
+                        });
+                    }
+                }
+                return matches;
+                """
+            ) or []
+        except WebDriverException as exc:
+            emit_log(log_callback, f"Litigantes cons: error buscando boton Cons. Lit.: {exc}")
+            return None, "button_search_failed"
 
-        popup_url = ""
-        if isinstance(result, dict):
-            popup_url = str(result.get("url") or "")
+        if button_candidates:
+            emit_log(log_callback, f"Litigantes cons: candidatos Cons. Lit.={button_candidates[:5]}")
+            try:
+                button = driver.execute_script(
+                    """
+                    function normalize(value) {
+                        return String(value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                    }
+                    var target = 'CONS. LIT.';
+                    var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
+                    for (var i = 0; i < elements.length; i++) {
+                        var el = elements[i];
+                        var text = normalize(el.innerText || el.textContent || el.value || '');
+                        var attrs = normalize(
+                            (el.getAttribute('id') || '') + ' ' +
+                            (el.getAttribute('name') || '') + ' ' +
+                            (el.getAttribute('title') || '') + ' ' +
+                            (el.getAttribute('aria-label') || '') + ' ' +
+                            (el.getAttribute('value') || '')
+                        );
+                        var visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        if (visible && (text.indexOf(target) >= 0 || attrs.indexOf(target) >= 0)) {
+                            return el;
+                        }
+                    }
+                    return null;
+                    """
+                )
+            except WebDriverException:
+                button = None
+
+        if button is None:
+            emit_log(log_callback, "Litigantes cons: boton Cons. Lit. no encontrado")
+            return None, "button_not_found"
+
+        try:
+            disabled_attr = button.get_attribute("disabled")
+            if disabled_attr is not None or "disabled" in (button.get_attribute("class") or "").lower():
+                emit_log(log_callback, "Litigantes cons: boton Cons. Lit. sigue deshabilitado")
+                return None, "button_disabled"
+        except WebDriverException:
+            pass
+
+        captured_url = ""
+        original_dialog = None
+        original_open = None
+        try:
+            captured_url = driver.execute_script(
+                """
+                var button = arguments[0];
+                var capturedUrl = "";
+                var originalDialog = window.showModalDialog;
+                var originalOpen = window.open;
+                try {
+                    window.showModalDialog = function(url) {
+                        capturedUrl = String(url || "");
+                        return null;
+                    };
+                    window.open = function(url) {
+                        capturedUrl = String(url || "");
+                        return null;
+                    };
+                    if (button && typeof button.click === 'function') {
+                        button.click();
+                    } else if (button) {
+                        button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    }
+                } finally {
+                    window.showModalDialog = originalDialog;
+                    window.open = originalOpen;
+                }
+                return capturedUrl;
+                """,
+                button,
+            )
+        except WebDriverException as exc:
+            emit_log(log_callback, f"Litigantes cons: fallo al clickear Cons. Lit.: {exc}")
+            return None, "button_click_failed"
+
+        popup_url = str(captured_url or "").strip()
+        emit_log(log_callback, f"Litigantes cons: popup Cons. Lit. capturado={bool(popup_url)} url={popup_url!r}")
         if not popup_url:
             return None, "popup_url_missing"
         return popup_url, ""
+    finally:
+        if opened_temp_handle:
+            try:
+                driver.close()
+            except WebDriverException:
+                pass
+        if original_handle:
+            try:
+                driver.switch_to.window(original_handle)
+                driver.switch_to.default_content()
+                wait_for_ready(driver, timeout=5)
+            except WebDriverException:
+                pass
 
-    return None, last_reason or "row_not_found"
+
+def switch_to_frame_path(driver, frame_path: list[int]) -> bool:
+    driver.switch_to.default_content()
+    try:
+        frames = []
+        for frame_index in frame_path:
+            frames = driver.find_elements(By.TAG_NAME, "frame") + driver.find_elements(By.TAG_NAME, "iframe")
+            frame_position = frame_index - 1
+            if frame_position < 0 or frame_position >= len(frames):
+                return False
+            driver.switch_to.frame(frames[frame_position])
+        return True
+    except WebDriverException:
+        return False
 
 
 def inspect_window_scopes(driver) -> list[dict]:
-    results = []
-    driver.switch_to.default_content()
+    results: list[dict] = []
 
-    scopes = [{"frame_index": "0", "frame_name": "documento principal"}]
-    frames = driver.find_elements(By.TAG_NAME, "frame") + driver.find_elements(By.TAG_NAME, "iframe")
-    for index, frame in enumerate(frames, start=1):
-        scopes.append(
-            {
-                "frame_index": str(index),
-                "frame_name": frame.get_attribute("name") or frame.get_attribute("id") or "",
-                "frame_src": frame.get_attribute("src") or "",
-            }
-        )
-
-    for scope in scopes:
-        driver.switch_to.default_content()
-        if scope["frame_index"] != "0":
-            frame_position = int(scope["frame_index"]) - 1
-            try:
-                driver.switch_to.frame(frames[frame_position])
-            except WebDriverException as exc:
-                results.append({**scope, "error": str(exc), "tables": [], "text": ""})
-                continue
-
+    def collect_scope(scope_name: str, frame_path: list[int], frame_src: str = "") -> None:
         html_source = ""
-        frame_src = scope.get("frame_src") or ""
-        text = read_frame_text(driver)
+        error = ""
+        tables = []
+        text = ""
+
+        try:
+            text = read_frame_text(driver)
+        except WebDriverException as exc:
+            error = str(exc)
+
         try:
             tables = extract_tables_from_current_frame(driver)
-        except WebDriverException:
+        except WebDriverException as exc:
+            if not error:
+                error = str(exc)
             tables = []
-            error = ""
+
+        try:
+            html_source = driver.page_source or ""
+        except WebDriverException as exc:
+            if not error:
+                error = str(exc)
+            html_source = ""
+
+        if not html_source:
             try:
-                html_source = driver.page_source or ""
-            except WebDriverException as page_source_exc:
-                error = str(page_source_exc)
-            if html_source:
-                tables = extract_tables_from_html_source(html_source)
-            elif not html_source:
-                try:
-                    html_source = driver.execute_script("return document.documentElement.outerHTML || document.body.outerHTML || '';") or ""
-                except WebDriverException:
-                    html_source = ""
-                if html_source:
-                    tables = extract_tables_from_html_source(html_source)
-        else:
-            error = ""
-            try:
-                html_source = driver.page_source or ""
+                html_source = driver.execute_script("return document.documentElement.outerHTML || document.body.outerHTML || '';") or ""
             except WebDriverException:
                 html_source = ""
 
@@ -2927,8 +3302,54 @@ def inspect_window_scopes(driver) -> list[dict]:
 
         if not text:
             text = html_source_to_text(html_source) if html_source else read_frame_source_text(driver)
-        results.append({**scope, "error": error, "tables": tables, "text": text, "html": html_source, "frame_src": frame_src})
 
+        results.append(
+            {
+                "frame_index": "0" if not frame_path else "/".join(str(part) for part in frame_path),
+                "frame_path": frame_path[:],
+                "frame_depth": len(frame_path),
+                "frame_name": scope_name,
+                "frame_src": frame_src,
+                "error": error,
+                "tables": tables,
+                "text": text,
+                "html": html_source,
+            }
+        )
+
+        try:
+            child_frames = driver.find_elements(By.TAG_NAME, "frame") + driver.find_elements(By.TAG_NAME, "iframe")
+        except WebDriverException:
+            child_frames = []
+
+        for child_index, child_frame in enumerate(child_frames, start=1):
+            child_name = child_frame.get_attribute("name") or child_frame.get_attribute("id") or f"frame_{child_index}"
+            child_src = child_frame.get_attribute("src") or ""
+            try:
+                driver.switch_to.frame(child_frame)
+                collect_scope(child_name, frame_path + [child_index], child_src)
+            except WebDriverException as exc:
+                results.append(
+                    {
+                        "frame_index": "/".join(str(part) for part in (frame_path + [child_index])),
+                        "frame_path": frame_path + [child_index],
+                        "frame_depth": len(frame_path) + 1,
+                        "frame_name": child_name,
+                        "frame_src": child_src,
+                        "error": str(exc),
+                        "tables": [],
+                        "text": "",
+                        "html": "",
+                    }
+                )
+            finally:
+                try:
+                    driver.switch_to.parent_frame()
+                except WebDriverException:
+                    driver.switch_to.default_content()
+
+    driver.switch_to.default_content()
+    collect_scope("documento principal", [])
     driver.switch_to.default_content()
     return results
 
@@ -2940,7 +3361,8 @@ def wait_for_window_scopes_content(driver, timeout: float = 8.0) -> list[dict]:
     while time.time() < deadline:
         last_results = inspect_window_scopes(driver)
         for scope in last_results:
-            if scope.get("tables") or (scope.get("text") or "").strip():
+            scope_text = f"{scope.get('text') or ''}\n{scope.get('html') or ''}".upper()
+            if scope.get("tables") or "DDO." in scope_text:
                 return last_results
         time.sleep(0.4)
 
@@ -3636,8 +4058,6 @@ def main() -> None:
     try:
         wait_for_ready(driver, timeout=10)
         submit_login(driver, username, password)
-        wait_for_ready(driver, timeout=30)
-        safe_get(driver, POST_LOGIN_URL, timeout=30)
         wait_for_ready(driver, timeout=30)
 
         submit_case_query(driver, case_type, case_number, case_year)
