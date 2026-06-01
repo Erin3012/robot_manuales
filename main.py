@@ -13,7 +13,7 @@ import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode
 from urllib.request import Request, urlopen
 import unicodedata
 
@@ -858,24 +858,193 @@ def switch_to_frame_with_form(driver, form_name: str, timeout: int = 20) -> None
 
 
 def wait_for_case_type_option(driver, case_type: str, timeout: int = 20) -> None:
-    WebDriverWait(driver, timeout).until(
-        lambda current: current.execute_script(
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda current: current.execute_script(
+                """
+                var form = document.forms["TramitarPpalForm"];
+                if (!form || !form.elements["TIP_Causa"]) {
+                    return false;
+                }
+                var options = form.elements["TIP_Causa"].options;
+                for (var i = 0; i < options.length; i++) {
+                    if (options[i].value === arguments[0] || options[i].text === arguments[0]) {
+                        return true;
+                    }
+                }
+                return false;
+                """,
+                case_type,
+            )
+        )
+    except TimeoutException as exc:
+        available_case_types = get_case_type_options(driver)
+        available_summary = ", ".join(
+            f"{item.get('value', '')}:{item.get('text', '')}" for item in available_case_types if item
+        )
+        raise RuntimeError(
+            f"El tipo de causa '{case_type}' no estuvo disponible en TIP_Causa. "
+            f"Opciones vistas: {available_summary or 'ninguna'}."
+        ) from exc
+
+
+def get_case_type_options(driver) -> list[dict[str, str]]:
+    try:
+        options = driver.execute_script(
             """
             var form = document.forms["TramitarPpalForm"];
-            if (!form || !form.elements["TIP_Causa"]) {
-                return false;
+            var select = form ? form.elements["TIP_Causa"] : null;
+            var values = [];
+            if (!select || !select.options) {
+                return values;
             }
-            var options = form.elements["TIP_Causa"].options;
-            for (var i = 0; i < options.length; i++) {
-                if (options[i].value === arguments[0]) {
-                    return true;
-                }
+            for (var i = 0; i < select.options.length; i++) {
+                values.push({
+                    value: String(select.options[i].value || ""),
+                    text: String(select.options[i].text || "")
+                });
             }
-            return false;
-            """,
-            case_type,
+            return values;
+            """
         )
+        return list(options or [])
+    except WebDriverException:
+        return []
+
+
+def get_query_form_snapshot(driver) -> dict[str, Any]:
+    try:
+        snapshot = driver.execute_script(
+            """
+            var form = document.forms["TramitarPpalForm"];
+            if (!form) {
+                throw new Error("No se encontro TramitarPpalForm");
+            }
+            var fields = {};
+            var elements = form.elements;
+            for (var i = 0; i < elements.length; i++) {
+                var el = elements[i];
+                if (!el || !el.name || el.disabled) {
+                    continue;
+                }
+                var tag = String(el.tagName || "").toLowerCase();
+                var type = String(el.type || "").toLowerCase();
+                if (type === "checkbox" || type === "radio") {
+                    if (el.checked) {
+                        fields[el.name] = String(el.value || "on");
+                    }
+                    continue;
+                }
+                if (tag === "select" && el.multiple) {
+                    var values = [];
+                    for (var j = 0; j < el.options.length; j++) {
+                        if (el.options[j].selected) {
+                            values.push(String(el.options[j].value || el.options[j].text || ""));
+                        }
+                    }
+                    fields[el.name] = values;
+                    continue;
+                }
+                fields[el.name] = String(el.value || "");
+            }
+            return {
+                action: String(form.action || ""),
+                method: String(form.method || "GET").toUpperCase(),
+                fields: fields
+            };
+            """
+        )
+        return dict(snapshot or {})
+    except WebDriverException as exc:
+        raise RuntimeError(f"No se pudo leer el formulario de consulta: {exc}") from exc
+
+
+def load_html_into_current_document(driver, html_text: str, base_url: str = "") -> None:
+    content = html_text or ""
+    if base_url:
+        base_tag = f'<base href="{html.escape(base_url, quote=True)}">'
+        lower = content.lower()
+        if "<head>" in lower and "<base" not in lower:
+            content = re.sub(r"(?i)<head>", "<head>" + base_tag, content, count=1)
+        elif "<html" in lower and "<head>" not in lower:
+            content = content.replace("<html", "<html><head>" + base_tag, 1)
+        elif "<head" not in lower:
+            content = base_tag + content
+
+    driver.execute_script(
+        """
+        var html = arguments[0];
+        document.open();
+        document.write(html);
+        document.close();
+        """,
+        content,
     )
+    wait_for_ready(driver, timeout=30)
+
+
+def submit_query_form_direct(driver, case_type: str, case_number: str, case_year: str) -> None:
+    form_snapshot = get_query_form_snapshot(driver)
+    action_url = urljoin(driver.current_url, str(form_snapshot.get("action") or ""))
+    method = str(form_snapshot.get("method") or "POST").upper()
+    fields = dict(form_snapshot.get("fields") or {})
+    fields["TIP_Causa"] = case_type
+    fields["ROL_Causa"] = case_number
+    fields["ERA_Causa"] = case_year
+
+    cookies = driver.get_cookies()
+    cookie_header = "; ".join(
+        f"{cookie['name']}={cookie['value']}" for cookie in cookies if cookie.get("name") is not None
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Referer": driver.current_url,
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+
+    if method == "GET":
+        query_string = urlencode(fields, doseq=True)
+        request_url = action_url + ("&" if "?" in action_url else "?") + query_string
+        request = Request(request_url, headers=headers)
+        post_data = None
+    else:
+        request = Request(action_url, data=urlencode(fields, doseq=True).encode("utf-8"), headers={**headers, "Content-Type": "application/x-www-form-urlencoded"})
+        post_data = True
+
+    with urlopen(request, timeout=60) as response:
+        content = response.read()
+        content_type = response.headers.get_content_type() or ""
+        final_url = response.geturl()
+
+    if "html" not in content_type.lower() and not content.lstrip().startswith(b"<"):
+        raise RuntimeError(f"La consulta directa no devolvio HTML (tipo={content_type or 'desconocido'}).")
+
+    try:
+        html_text = content.decode("utf-8", errors="replace")
+    except Exception:
+        html_text = content.decode("latin-1", errors="replace")
+
+    load_html_into_current_document(driver, html_text, final_url)
+
+
+def find_case_type_scope(driver, case_type: str) -> dict | None:
+    try:
+        scope_results = inspect_window_scopes(driver)
+    except WebDriverException:
+        return None
+
+    target = case_type.strip().upper()
+    if not target:
+        return None
+
+    for scope in scope_results:
+        html_source = (scope.get("html") or "").upper()
+        if "TIP_CAUSA" not in html_source:
+            continue
+        if f"VALUE={target}" in html_source or f">{target}<" in html_source:
+            return scope
+    return None
 
 
 def wait_for_query_form_inputs(driver, timeout: int = 20) -> None:
@@ -1898,6 +2067,85 @@ def consult_case(
     }
 
 
+def consult_history_only(
+    driver,
+    rit: str,
+    log_callback: LogCallback | None = None,
+) -> list[dict]:
+    total_start = time.perf_counter()
+    case_type, case_number, case_year = parse_rit_value(rit)
+    original_handle = ""
+    temp_handle = ""
+
+    try:
+        original_handle = driver.current_window_handle
+    except WebDriverException:
+        original_handle = ""
+
+    try:
+        emit_log(log_callback, f"Historia secundaria: iniciando para {rit}")
+        before_handles = set()
+        try:
+            before_handles = set(driver.window_handles)
+        except WebDriverException:
+            before_handles = set()
+
+        driver.execute_script("window.open(arguments[0], '_blank');", POST_LOGIN_URL)
+        wait_start = time.perf_counter()
+        while time.perf_counter() - wait_start < 10:
+            try:
+                current_handles = set(driver.window_handles)
+            except WebDriverException:
+                current_handles = set()
+            new_handles = list(current_handles - before_handles)
+            if new_handles:
+                temp_handle = new_handles[0]
+                break
+            time.sleep(0.2)
+
+        if not temp_handle:
+            raise RuntimeError("No se pudo abrir una ventana temporal para consultar la historia.")
+
+        driver.switch_to.window(temp_handle)
+        driver.switch_to.default_content()
+        wait_for_ready(driver, timeout=10)
+        emit_log(log_callback, "Historia secundaria: ventana temporal lista")
+
+        step_start = time.perf_counter()
+        emit_log(log_callback, "Historia secundaria: preparando formulario de búsqueda")
+        form_mode = ensure_query_form_ready(driver, timeout=15)
+        driver.switch_to.default_content()
+        emit_log(
+            log_callback,
+            f"Historia secundaria: formulario listo en {time.perf_counter() - step_start:.1f}s ({'reutilizado' if form_mode == 'reused' else 'navegado'})",
+        )
+
+        step_start = time.perf_counter()
+        emit_log(log_callback, "Historia secundaria: enviando RIT")
+        submit_case_query(driver, case_type, case_number, case_year)
+        emit_log(log_callback, f"Historia secundaria: causa cargada en {time.perf_counter() - step_start:.1f}s")
+
+        step_start = time.perf_counter()
+        historia = collect_history_rows(driver)
+        emit_log(log_callback, f"Historia secundaria: {len(historia)} filas en {time.perf_counter() - step_start:.1f}s")
+        emit_log(log_callback, f"Historia secundaria total terminada en {time.perf_counter() - total_start:.1f}s")
+        return historia
+    finally:
+        if temp_handle:
+            try:
+                driver.switch_to.window(temp_handle)
+                driver.close()
+            except WebDriverException:
+                pass
+        if original_handle:
+            try:
+                driver.switch_to.window(original_handle)
+                driver.switch_to.default_content()
+                wait_for_ready(driver, timeout=5)
+            except WebDriverException:
+                pass
+
+
 def download_pdf_with_session(driver, pdf_url: str, output_path: Path) -> Path:
     download_session_resource(driver, pdf_url, output_path)
     return output_path
@@ -2086,48 +2334,75 @@ def prompt_section_selection(
 
 def submit_case_query(driver, case_type: str, case_number: str, case_year: str) -> None:
     switch_to_frame_with_form(driver, "TramitarPpalForm", timeout=20)
+    target_scope = find_case_type_scope(driver, case_type)
+    if target_scope and target_scope.get("frame_path"):
+        frame_path = [int(part) for part in target_scope.get("frame_path") or []]
+        if frame_path:
+            switch_to_frame_path(driver, frame_path)
+
+    if case_type.upper() == "M":
+        submit_query_form_direct(driver, case_type, case_number, case_year)
+        driver.switch_to.default_content()
+        wait_for_ready(driver, timeout=30)
+        return
+
     wait_for_case_type_option(driver, case_type, timeout=20)
 
-    result = driver.execute_script(
-        """
-        var data = arguments[0];
-        var form = document.forms["TramitarPpalForm"];
-        if (!form) {
-            throw new Error("No se encontro TramitarPpalForm");
-        }
+    try:
+        driver.execute_script(
+            """
+            var data = arguments[0];
+            var form = document.forms["TramitarPpalForm"];
+            if (!form) {
+                throw new Error("No se encontro TramitarPpalForm");
+            }
 
-        var setSelect = function(select, value) {
-            var found = false;
-            for (var i = 0; i < select.options.length; i++) {
-                if (select.options[i].value === value || select.options[i].text === value) {
-                    select.selectedIndex = i;
-                    select.value = select.options[i].value;
-                    found = true;
-                    break;
+            var setSelect = function(select, value) {
+                var found = false;
+                for (var i = 0; i < select.options.length; i++) {
+                    if (select.options[i].value === value || select.options[i].text === value) {
+                        select.selectedIndex = i;
+                        select.value = select.options[i].value;
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            if (!found) {
-                throw new Error("No existe la opcion " + value + " en " + select.name);
-            }
-            if (select.fireEvent) {
-                select.fireEvent("onchange");
-            } else if (typeof select.onchange === "function") {
-                select.onchange();
-            }
-        };
+                if (!found) {
+                    throw new Error("No existe la opcion " + value + " en " + select.name);
+                }
+                if (select.fireEvent) {
+                    select.fireEvent("onchange");
+                } else if (typeof select.onchange === "function") {
+                    select.onchange();
+                }
+            };
 
-        setSelect(form.elements["TIP_Causa"], data.caseType);
-        form.elements["ROL_Causa"].value = data.caseNumber;
-        setSelect(form.elements["ERA_Causa"], data.caseYear);
+            setSelect(form.elements["TIP_Causa"], data.caseType);
+            form.elements["ROL_Causa"].value = data.caseNumber;
+            setSelect(form.elements["ERA_Causa"], data.caseYear);
 
-        return {
-            caseType: form.elements["TIP_Causa"].value,
-            caseNumber: form.elements["ROL_Causa"].value,
-            caseYear: form.elements["ERA_Causa"].value
-        };
-        """,
-        {"caseType": case_type, "caseNumber": case_number, "caseYear": case_year},
-    )
+            return {
+                caseType: form.elements["TIP_Causa"].value,
+                caseNumber: form.elements["ROL_Causa"].value,
+                caseYear: form.elements["ERA_Causa"].value
+            };
+            """,
+            {"caseType": case_type, "caseNumber": case_number, "caseYear": case_year},
+        )
+    except Exception as exc:
+        if case_type != "M":
+            available_case_types = get_case_type_options(driver)
+            available_summary = ", ".join(
+                f"{item.get('value', '')}:{item.get('text', '')}" for item in available_case_types if item
+            )
+            raise RuntimeError(
+                f"No se pudo seleccionar el tipo de causa '{case_type}'. Opciones disponibles: {available_summary or 'ninguna'}."
+            ) from exc
+
+        submit_query_form_direct(driver, case_type, case_number, case_year)
+        driver.switch_to.default_content()
+        wait_for_ready(driver, timeout=30)
+        return
 
     driver.execute_script(
         """
