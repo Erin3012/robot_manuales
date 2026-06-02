@@ -29,12 +29,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 LOGIN_URL = "http://www.familia.pjud/SITFAWEB/jsp/Login/Login.jsp"
 POST_LOGIN_URL = "http://www.familia.pjud/SITFAWEB/MenuLinkAction.do?opMenu=ConsultaRolTramitar&opRol=59"
+PENDING_CASES_URL = "http://www.familia.pjud/SITFAWEB/TrmPendientesViewAccion.do?TipoTramite=2"
 PDF_VIEWER_HOST = "127.0.0.1"
 PDF_VIEWER_PORT = 54877
 PDF_VIEWER_SCRIPT = Path(__file__).with_name("pdf_viewer.py")
 
 LogCallback = Callable[[str], None]
 SectionCallback = Callable[[str, list[dict]], None]
+ProgressCallback = Callable[[str, float], None]
 
 
 ELEMENTS_SCRIPT = """
@@ -2012,10 +2014,15 @@ def consult_case(
     rit: str,
     log_callback: LogCallback | None = None,
     section_callback: SectionCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, list[dict]]:
     total_start = time.perf_counter()
     case_type, case_number, case_year = parse_rit_value(rit)
+    def emit_progress(message: str, percent: float) -> None:
+        if progress_callback is not None:
+            progress_callback(message, max(0.0, min(100.0, float(percent))))
     emit_log(log_callback, f"Consulta: iniciando para {rit}")
+    emit_progress("Preparando busqueda", 5)
 
     step_start = time.perf_counter()
     emit_log(log_callback, "Consulta: preparando formulario de búsqueda")
@@ -2036,18 +2043,21 @@ def consult_case(
     emit_log(log_callback, f"Historia: {len(historia)} filas en {time.perf_counter() - step_start:.1f}s")
     if section_callback is not None:
         section_callback("historia", historia)
+    emit_progress("Historia cargada", 52)
 
     step_start = time.perf_counter()
     liquidacion = collect_liquidacion_rows(driver)
     emit_log(log_callback, f"Liquidación: {len(liquidacion)} filas en {time.perf_counter() - step_start:.1f}s")
     if section_callback is not None:
         section_callback("liquidacion", liquidacion)
+    emit_progress("Liquidacion cargada", 68)
 
     step_start = time.perf_counter()
     escritos = collect_escritos_resolver_rows(driver)
     emit_log(log_callback, f"Esc. por Resolv.: {len(escritos)} filas en {time.perf_counter() - step_start:.1f}s")
     if section_callback is not None:
         section_callback("escritos", escritos)
+    emit_progress("Escritos por resolver cargados", 80)
 
     step_start = time.perf_counter()
     litigantes, cons_lit = collect_litigantes_and_cons_lit_rows(driver, subject_label="DDO.", log_callback=log_callback)
@@ -2056,8 +2066,10 @@ def consult_case(
     if section_callback is not None:
         section_callback("litigantes", litigantes)
         section_callback("cons_lit", cons_lit)
+    emit_progress("Litigantes y Cons. Lit. cargados", 95)
 
     emit_log(log_callback, f"Consulta total terminada en {time.perf_counter() - total_start:.1f}s")
+    emit_progress("Consulta terminada", 100)
     return {
         "historia": historia,
         "liquidacion": liquidacion,
@@ -3136,6 +3148,193 @@ def extract_cons_lit_rows_from_html(source: str) -> list[dict]:
     return best_rows
 
 
+def _looks_like_rit_value(value: str) -> bool:
+    parts = [part.strip() for part in (value or "").upper().split("-")]
+    return len(parts) == 3 and bool(parts[0]) and bool(parts[1]) and bool(parts[2]) and parts[2].isdigit()
+
+
+def extract_pending_case_rows_from_html(source: str) -> list[dict]:
+    best_rows: list[dict] = []
+    best_score = 0
+    hidden_headers = {
+        normalize_header_name("Sel."),
+        normalize_header_name("Doc."),
+        normalize_header_name("Tipo trámite"),
+        normalize_header_name("Funcionario"),
+        normalize_header_name("Obs. Devuelto"),
+    }
+
+    for table in extract_tables_from_html_source(source):
+        rows_data = table.get("rows_data") or []
+        if not rows_data:
+            continue
+
+        header_row_index = None
+        header_cells: list[str] = []
+        for index, row in enumerate(rows_data):
+            cells = row.get("cells") or []
+            if row.get("kind") == "header" and cells:
+                header_row_index = index
+                header_cells = cells
+                break
+
+        if not header_cells and rows_data:
+            first_row_cells = rows_data[0].get("cells") or []
+            if first_row_cells:
+                header_row_index = 0
+                header_cells = first_row_cells
+
+        if not header_cells:
+            continue
+
+        normalized_headers = [normalize_header_name(cell) for cell in header_cells]
+        rit_indexes = [
+            index
+            for index, header in enumerate(normalized_headers)
+            if "rit" in header or "rol" in header or "causa" in header
+        ]
+        if not rit_indexes:
+            continue
+
+        candidate_rows: list[dict] = []
+        for row in rows_data[header_row_index + 1 if header_row_index is not None else 1 :]:
+            cells = row.get("cells") or []
+            if not any(cell.strip() for cell in cells):
+                continue
+
+            extracted: dict[str, str] = {}
+            for header_name, cell_index in zip(header_cells, range(len(header_cells))):
+                raw_value = cells[cell_index] if cell_index < len(cells) else ""
+                extracted[header_name] = normalize_litigantes_value(raw_value)
+
+            rit_value = ""
+            rit_header_name = ""
+            for header_name, value in extracted.items():
+                normalized_header = normalize_header_name(header_name)
+                if "rit" in normalized_header or "rol" in normalized_header or "causa" in normalized_header:
+                    rit_value = value
+                    rit_header_name = header_name
+                    break
+
+            if not rit_value:
+                for value in extracted.values():
+                    if _looks_like_rit_value(value):
+                        rit_value = value
+                        break
+
+            if not rit_value:
+                continue
+
+            try:
+                rit_type, rit_number, rit_year = parse_rit_value(rit_value)
+                rit_value = f"{rit_type}-{rit_number}-{rit_year}"
+            except ValueError:
+                if not _looks_like_rit_value(rit_value):
+                    continue
+
+            normalized_row = {
+                key: value
+                for key, value in extracted.items()
+                if key and normalize_header_name(key) not in hidden_headers
+            }
+            normalized_row["RIT"] = rit_value
+            if rit_header_name and rit_header_name != "RIT":
+                normalized_row.setdefault(rit_header_name, rit_value)
+            candidate_rows.append(normalized_row)
+
+        score = len(candidate_rows)
+        if score > best_score:
+            best_score = score
+            best_rows = candidate_rows
+
+    return best_rows
+
+
+def click_pending_cases_all_and_submit(driver) -> None:
+    driver.switch_to.default_content()
+    driver.execute_script(
+        """
+        var form = document.forms["TramitarPpalForm"];
+        if (!form) {
+            throw new Error("No se encontro TramitarPpalForm");
+        }
+
+        var radios = form.querySelectorAll('input[type="radio"][name="TIP_ConsultaL"]');
+        if (!radios || radios.length < 1) {
+            throw new Error("No se encontraron opciones de consulta");
+        }
+
+        var selected = false;
+        for (var i = 0; i < radios.length; i++) {
+            var radio = radios[i];
+            var labelText = "";
+            if (radio.parentNode) {
+                labelText = String(radio.parentNode.textContent || "").replace(/\\s+/g, " ").trim();
+            }
+            if (i === 0 || /\\bTodas\\b/i.test(labelText)) {
+                radio.checked = true;
+                selected = true;
+            } else {
+                radio.checked = false;
+            }
+        }
+
+        if (!selected) {
+            throw new Error("No se pudo marcar la opcion Todas");
+        }
+
+        var submitButton = form.querySelector('input[type="submit"][value="Cons.Actuaciones"]');
+        if (!submitButton) {
+            submitButton = form.querySelector('input[name="irAccionTramitarT"]');
+        }
+        if (!submitButton) {
+            throw new Error("No se encontro el boton Cons.Actuaciones");
+        }
+
+        if (typeof submitButton.click === "function") {
+            submitButton.click();
+        } else {
+            submitButton.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+        }
+        """
+    )
+    wait_for_ready(driver, timeout=30)
+
+
+def collect_pending_case_rows(driver, log_callback: LogCallback | None = None) -> list[dict]:
+    total_start = time.perf_counter()
+    emit_log(log_callback, "Pendientes: abriendo listado de causas")
+    driver.get(PENDING_CASES_URL)
+    wait_for_ready(driver, timeout=30)
+
+    emit_log(log_callback, "Pendientes: seleccionando Todas y consultando actuaciones")
+    click_pending_cases_all_and_submit(driver)
+
+    deadline = time.time() + float(os.getenv("SITFA_WINDOW_WAIT", "8"))
+    last_rows: list[dict] = []
+    last_url = ""
+
+    while time.time() < deadline:
+        scope_results = inspect_window_scopes(driver)
+        last_url = driver.current_url
+        best_rows: list[dict] = []
+        for scope in scope_results:
+            scope_rows = extract_pending_case_rows_from_html(scope.get("html") or "")
+            if len(scope_rows) > len(best_rows):
+                best_rows = scope_rows
+        last_rows = best_rows
+        if last_rows:
+            break
+        time.sleep(0.4)
+
+    emit_log(
+        log_callback,
+        f"Pendientes: {len(last_rows)} filas cargadas en {time.perf_counter() - total_start:.1f}s "
+        f"(url={last_url or PENDING_CASES_URL})",
+    )
+    return last_rows
+
+
 def print_cons_lit_table_from_html(source: str) -> bool:
     wanted_headers = [
         "RIT",
@@ -3306,6 +3505,7 @@ def open_cons_lit_popup_from_litigantes(
                         pass
                 return None, "popup_open_failed"
 
+        target_subject = normalize_litigantes_value(subject_label).strip().upper()
         target_row = None
         candidate_count = 0
         sample_labels: list[str] = []
@@ -3331,21 +3531,37 @@ def open_cons_lit_popup_from_litigantes(
 
         for row in rows:
             try:
-                row_text = str(row.text or row.get_attribute("innerText") or row.get_attribute("textContent") or "")
-                row_text = " ".join(row_text.replace("\xa0", " ").split()).upper()
+                row_cells = row.find_elements(By.TAG_NAME, "td") + row.find_elements(By.TAG_NAME, "th")
             except WebDriverException:
                 continue
-            if "DDO." not in row_text:
+
+            cell_values: list[str] = []
+            exact_match = False
+            for cell in row_cells:
+                try:
+                    cell_value = normalize_litigantes_value(
+                        str(cell.text or cell.get_attribute("innerText") or cell.get_attribute("textContent") or "")
+                    ).strip().upper()
+                except WebDriverException:
+                    continue
+                if not cell_value:
+                    continue
+                cell_values.append(cell_value)
+                if cell_value == target_subject:
+                    exact_match = True
+
+            if not exact_match:
                 continue
+
             candidate_count += 1
             if len(sample_labels) < 5:
-                sample_labels.append(row_text)
+                sample_labels.append(" | ".join(cell_values))
             target_row = row
             break
 
         emit_log(
             log_callback,
-            f"Litigantes cons: busqueda DDO. candidates={candidate_count} samples={sample_labels}",
+            f"Litigantes cons: busqueda exacta {target_subject} candidates={candidate_count} samples={sample_labels}",
         )
 
         if target_row is None:
