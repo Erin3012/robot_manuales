@@ -39,6 +39,35 @@ SectionCallback = Callable[[str, list[dict]], None]
 ProgressCallback = Callable[[str, float], None]
 
 
+def load_dotenv_file(path: Path | None = None) -> None:
+    env_path = path or Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+load_dotenv_file()
+
+
 ELEMENTS_SCRIPT = """
 var cssPath = function(element) {
     if (element.id) {
@@ -706,7 +735,7 @@ def parse_rit_value(rit: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-def parse_runtime_options() -> tuple[str, bool]:
+def parse_runtime_options() -> tuple[str, bool, bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--browser",
@@ -726,6 +755,12 @@ def parse_runtime_options() -> tuple[str, bool]:
         default=False,
         help="Force a visible browser window.",
     )
+    parser.add_argument(
+        "--dump-litigantes-html",
+        action="store_true",
+        default=False,
+        help="Login, open the Litigantes popup, and dump its HTML to debug_dumps.",
+    )
     args = parser.parse_args()
 
     browser = args.browser or os.getenv("SITFA_BROWSER", "").strip().lower()
@@ -738,7 +773,7 @@ def parse_runtime_options() -> tuple[str, bool]:
     if args.visible:
         headless = False
 
-    return browser, headless
+    return browser, headless, bool(args.dump_litigantes_html)
 
 
 def create_driver(initial_url: str | None = None, browser: str = "edge", headless: bool = False):
@@ -1997,6 +2032,16 @@ def describe_litigantes_popup(driver) -> None:
         print("No se pudo extraer la informacion de Litigantes.")
     finally:
         restore_primary_window(driver, original_handle)
+
+
+def export_litigantes_popup_html(driver) -> Path:
+    popup_url = resolve_litigantes_popup_url(driver)
+    if not popup_url:
+        raise RuntimeError("No se pudo localizar el popup de Litigantes.")
+
+    dump_dir = dump_popup_html_from_url(driver, "litigantes", popup_url)
+    print(f"HTML de Litigantes guardado en: {dump_dir}")
+    return dump_dir
 
 
 def login_to_sitfa(driver, username: str, password: str, log_callback: LogCallback | None = None) -> None:
@@ -3443,11 +3488,14 @@ def dump_popup_html_from_url(driver, prefix: str, popup_url: str) -> Path:
     return dump_dir
 
 
-def open_cons_lit_popup_from_litigantes(
+def _open_litigantes_action_popup_from_litigantes(
     driver,
+    action_target: str,
     subject_label: str = "DDO.",
     litigantes_popup_url: str = "",
     log_callback: LogCallback | None = None,
+    target_row_data: dict[str, str] | None = None,
+    action_log_prefix: str = "Litigantes action",
 ) -> tuple[str | None, str]:
     original_handle = ""
     opened_temp_handle = ""
@@ -3457,6 +3505,7 @@ def open_cons_lit_popup_from_litigantes(
         original_handle = ""
 
     try:
+        emit_log(log_callback, f"{action_log_prefix}: inicio de apertura")
         if litigantes_popup_url:
             try:
                 resolved_url = litigantes_popup_url
@@ -3465,9 +3514,9 @@ def open_cons_lit_popup_from_litigantes(
                     wrapper_frame_src = extract_popup_frame_src(wrapper_html)
                     if wrapper_frame_src:
                         resolved_url = wrapper_frame_src
-                        emit_log(log_callback, f"Litigantes cons: frame_src resuelto para popup {resolved_url}")
+                        emit_log(log_callback, f"{action_log_prefix}: frame_src resuelto para popup {resolved_url}")
                 except Exception as exc:
-                    emit_log(log_callback, f"Litigantes cons: no se pudo resolver frame_src: {exc}")
+                    emit_log(log_callback, f"{action_log_prefix}: no se pudo resolver frame_src: {exc}")
 
                 before_handles = set(driver.window_handles)
                 driver.execute_script("window.open(arguments[0], '_blank');", resolved_url)
@@ -3483,16 +3532,16 @@ def open_cons_lit_popup_from_litigantes(
                     raise RuntimeError("No se pudo abrir una ventana nueva para Litigantes")
                 driver.switch_to.window(opened_temp_handle)
                 wait_for_ready(driver, timeout=10)
-                emit_log(log_callback, "Litigantes cons: popup de litigantes abierto en ventana temporal")
+                emit_log(log_callback, f"{action_log_prefix}: popup de litigantes abierto en ventana temporal")
                 scope_results = wait_for_window_scopes_content(driver, timeout=8.0)
                 scope_summary = [
                     f"{scope.get('frame_index')}:{(scope.get('frame_name') or '').strip()} "
                     f"text_has_ddo={'DDO.' in ((scope.get('text') or '') + ' ' + (scope.get('html') or '')).upper()}"
                     for scope in scope_results
                 ]
-                emit_log(log_callback, f"Litigantes cons: scopes={scope_summary}")
+                emit_log(log_callback, f"{action_log_prefix}: scopes={scope_summary}")
             except Exception as exc:
-                emit_log(log_callback, f"Litigantes cons: no se pudo abrir popup temporal: {exc}")
+                emit_log(log_callback, f"{action_log_prefix}: no se pudo abrir popup temporal: {exc}")
                 if opened_temp_handle:
                     try:
                         driver.close()
@@ -3506,16 +3555,28 @@ def open_cons_lit_popup_from_litigantes(
                 return None, "popup_open_failed"
 
         target_subject = normalize_litigantes_value(subject_label).strip().upper()
+        target_values: dict[str, str] = {}
+        if target_row_data:
+            for key in ("Sujeto", "Rut/Pasaporte", "Nombre o Razón Social", "Fec. Nacimiento"):
+                normalized_value = normalize_litigantes_value(str(target_row_data.get(key, ""))).strip().upper()
+                if normalized_value:
+                    target_values[key] = normalized_value
+        emit_log(
+            log_callback,
+            f"{action_log_prefix}: objetivo sujeto={target_subject!r} campos={list(target_values.keys())}",
+        )
         target_row = None
         candidate_count = 0
+        fallback_count = 0
         sample_labels: list[str] = []
         try:
             rows = []
             scope_results = wait_for_window_scopes_content(driver, timeout=4.0)
             target_scope = None
+            scope_terms = [target_subject] + [value for value in target_values.values() if value]
             for scope in scope_results:
                 scope_text = f"{scope.get('text') or ''}\n{scope.get('html') or ''}".upper()
-                if "DDO." in scope_text:
+                if any(term and term in scope_text for term in scope_terms):
                     target_scope = scope
                     break
 
@@ -3526,8 +3587,10 @@ def open_cons_lit_popup_from_litigantes(
             if not rows:
                 rows = driver.find_elements(By.TAG_NAME, "tr")
         except WebDriverException as exc:
-            emit_log(log_callback, f"Litigantes cons: no se pudieron leer filas: {exc}")
+            emit_log(log_callback, f"{action_log_prefix}: no se pudieron leer filas: {exc}")
             return None, "row_read_failed"
+
+        emit_log(log_callback, f"{action_log_prefix}: filas visibles={len(rows)}")
 
         for row in rows:
             try:
@@ -3536,7 +3599,13 @@ def open_cons_lit_popup_from_litigantes(
                 continue
 
             cell_values: list[str] = []
-            exact_match = False
+            row_values_by_header = {
+                "Sujeto": "",
+                "Rut/Pasaporte": "",
+                "Nombre o Razón Social": "",
+                "Fec. Nacimiento": "",
+                "Edad": "",
+            }
             for cell in row_cells:
                 try:
                     cell_value = normalize_litigantes_value(
@@ -3547,8 +3616,26 @@ def open_cons_lit_popup_from_litigantes(
                 if not cell_value:
                     continue
                 cell_values.append(cell_value)
-                if cell_value == target_subject:
+            if cell_values:
+                row_values_by_header["Sujeto"] = cell_values[0] if len(cell_values) > 0 else ""
+                row_values_by_header["Rut/Pasaporte"] = cell_values[1] if len(cell_values) > 1 else ""
+                row_values_by_header["Nombre o Razón Social"] = cell_values[2] if len(cell_values) > 2 else ""
+                row_values_by_header["Fec. Nacimiento"] = cell_values[3] if len(cell_values) > 3 else ""
+                row_values_by_header["Edad"] = cell_values[4] if len(cell_values) > 4 else ""
+
+            exact_match = False
+            subject_match = bool(target_subject) and row_values_by_header.get("Sujeto", "") == target_subject
+            if target_values:
+                exact_match = True
+                for key, expected_value in target_values.items():
+                    if expected_value and row_values_by_header.get(key, "") != expected_value:
+                        exact_match = False
+                        break
+                if not exact_match and subject_match:
                     exact_match = True
+                    fallback_count += 1
+            else:
+                exact_match = subject_match or any(cell_value == target_subject for cell_value in cell_values)
 
             if not exact_match:
                 continue
@@ -3561,10 +3648,23 @@ def open_cons_lit_popup_from_litigantes(
 
         emit_log(
             log_callback,
-            f"Litigantes cons: busqueda exacta {target_subject} candidates={candidate_count} samples={sample_labels}",
+            f"{action_log_prefix}: busqueda objetivo={target_subject} exactos={candidate_count} fallback={fallback_count} samples={sample_labels}",
         )
 
         if target_row is None:
+            try:
+                preview_rows = []
+                for row in rows[:8]:
+                    try:
+                        preview = row.text or row.get_attribute("innerText") or row.get_attribute("textContent") or ""
+                    except WebDriverException:
+                        preview = ""
+                    preview = normalize_litigantes_value(preview).strip()
+                    if preview:
+                        preview_rows.append(preview[:220])
+                emit_log(log_callback, f"{action_log_prefix}: primeras filas={preview_rows}")
+            except WebDriverException:
+                pass
             return None, "row_not_found"
 
         try:
@@ -3584,9 +3684,9 @@ def open_cons_lit_popup_from_litigantes(
                 """,
                 target_row,
             )
-            emit_log(log_callback, "Litigantes cons: click sobre DDO. ejecutado")
+            emit_log(log_callback, f"{action_log_prefix}: click sobre fila ejecutado")
         except WebDriverException as exc:
-            emit_log(log_callback, f"Litigantes cons: fallo al clickear DDO.: {exc}")
+            emit_log(log_callback, f"{action_log_prefix}: fallo al clickear fila: {exc}")
             return None, "row_click_failed"
 
         button = None
@@ -3597,7 +3697,7 @@ def open_cons_lit_popup_from_litigantes(
                 function normalize(value) {
                     return String(value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
                 }
-                var target = 'CONS. LIT.';
+                var target = arguments[0];
                 var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
                 var matches = [];
                 for (var i = 0; i < elements.length; i++) {
@@ -3624,21 +3724,22 @@ def open_cons_lit_popup_from_litigantes(
                     }
                 }
                 return matches;
-                """
+                """,
+                action_target,
             ) or []
         except WebDriverException as exc:
-            emit_log(log_callback, f"Litigantes cons: error buscando boton Cons. Lit.: {exc}")
+            emit_log(log_callback, f"{action_log_prefix}: error buscando boton {action_target}: {exc}")
             return None, "button_search_failed"
 
         if button_candidates:
-            emit_log(log_callback, f"Litigantes cons: candidatos Cons. Lit.={button_candidates[:5]}")
+            emit_log(log_callback, f"{action_log_prefix}: candidatos {action_target}={button_candidates[:5]}")
             try:
                 button = driver.execute_script(
                     """
                     function normalize(value) {
                         return String(value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
                     }
-                    var target = 'CONS. LIT.';
+                    var target = arguments[0];
                     var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
                     for (var i = 0; i < elements.length; i++) {
                         var el = elements[i];
@@ -3656,19 +3757,20 @@ def open_cons_lit_popup_from_litigantes(
                         }
                     }
                     return null;
-                    """
+                    """,
+                    action_target,
                 )
             except WebDriverException:
                 button = None
 
         if button is None:
-            emit_log(log_callback, "Litigantes cons: boton Cons. Lit. no encontrado")
+            emit_log(log_callback, f"{action_log_prefix}: boton {action_target} no encontrado")
             return None, "button_not_found"
 
         try:
             disabled_attr = button.get_attribute("disabled")
             if disabled_attr is not None or "disabled" in (button.get_attribute("class") or "").lower():
-                emit_log(log_callback, "Litigantes cons: boton Cons. Lit. sigue deshabilitado")
+                emit_log(log_callback, f"{action_log_prefix}: boton {action_target} sigue deshabilitado")
                 return None, "button_disabled"
         except WebDriverException:
             pass
@@ -3698,19 +3800,19 @@ def open_cons_lit_popup_from_litigantes(
                         button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                     }
                 } finally {
-                    window.showModalDialog = originalDialog;
-                    window.open = originalOpen;
-                }
-                return capturedUrl;
+                window.showModalDialog = originalDialog;
+                window.open = originalOpen;
+            }
+            return capturedUrl;
                 """,
                 button,
             )
         except WebDriverException as exc:
-            emit_log(log_callback, f"Litigantes cons: fallo al clickear Cons. Lit.: {exc}")
+            emit_log(log_callback, f"{action_log_prefix}: fallo al clickear boton {action_target}: {exc}")
             return None, "button_click_failed"
 
         popup_url = str(captured_url or "").strip()
-        emit_log(log_callback, f"Litigantes cons: popup Cons. Lit. capturado={bool(popup_url)} url={popup_url!r}")
+        emit_log(log_callback, f"{action_log_prefix}: popup {action_target} capturado={bool(popup_url)} url={popup_url!r}")
         if not popup_url:
             return None, "popup_url_missing"
         return popup_url, ""
@@ -3727,6 +3829,45 @@ def open_cons_lit_popup_from_litigantes(
                 wait_for_ready(driver, timeout=5)
             except WebDriverException:
                 pass
+
+
+def open_cons_lit_popup_from_litigantes(
+    driver,
+    subject_label: str = "DDO.",
+    litigantes_popup_url: str = "",
+    log_callback: LogCallback | None = None,
+) -> tuple[str | None, str]:
+    return _open_litigantes_action_popup_from_litigantes(
+        driver,
+        action_target="CONS. LIT.",
+        subject_label=subject_label,
+        litigantes_popup_url=litigantes_popup_url,
+        log_callback=log_callback,
+        action_log_prefix="Litigantes cons",
+    )
+
+
+def open_cartola_bco_estado_popup_from_litigantes(
+    driver,
+    selected_litigante: dict[str, str] | None = None,
+    subject_label: str = "DDO.",
+    litigantes_popup_url: str = "",
+    log_callback: LogCallback | None = None,
+) -> tuple[str | None, str]:
+    derived_subject = subject_label
+    if selected_litigante:
+        selected_subject = normalize_litigantes_value(str(selected_litigante.get("Sujeto", ""))).strip()
+        if selected_subject:
+            derived_subject = selected_subject
+    return _open_litigantes_action_popup_from_litigantes(
+        driver,
+        action_target="CARTOLA BCO.ESTADO",
+        subject_label=derived_subject,
+        litigantes_popup_url=litigantes_popup_url,
+        log_callback=log_callback,
+        target_row_data=selected_litigante,
+        action_log_prefix="Litigantes cartola",
+    )
 
 
 def switch_to_frame_path(driver, frame_path: list[int]) -> bool:
@@ -4542,7 +4683,7 @@ def run_action_menu(driver) -> None:
 
 
 def main() -> None:
-    browser, headless = parse_runtime_options()
+    browser, headless, dump_litigantes_html = parse_runtime_options()
     username, password = read_credentials()
     case_type, case_number, case_year = read_case_query()
     driver = create_driver(initial_url=LOGIN_URL, browser=browser, headless=headless)
@@ -4552,6 +4693,9 @@ def main() -> None:
         wait_for_ready(driver, timeout=30)
 
         submit_case_query(driver, case_type, case_number, case_year)
+        if dump_litigantes_html:
+            export_litigantes_popup_html(driver)
+            return
         history_rows = print_history_tab(driver)
         liquidacion_rows = print_liquidacion_tab(driver)
         escritos_resolver_rows = print_escritos_resolver_tab(driver)

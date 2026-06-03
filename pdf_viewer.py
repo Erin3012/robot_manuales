@@ -27,10 +27,14 @@ class PdfViewerApp:
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
+        toolbar = ttk.Frame(self.root, padding=(8, 6))
+        toolbar.pack(fill="x")
+        ttk.Button(toolbar, text="Cerrar pestaña actual", command=self._close_current_tab).pack(side="right")
 
         self.message_queue: queue.Queue[dict] = queue.Queue()
         self.tab_counters: dict[str, int] = {}
         self._recent_sources: dict[str, float] = {}
+        self._home_tab = None
 
         self._build_empty_state()
         self._start_server()
@@ -39,6 +43,7 @@ class PdfViewerApp:
     def _build_empty_state(self) -> None:
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="Inicio")
+        self._home_tab = frame
 
         label = ttk.Label(
             frame,
@@ -112,6 +117,32 @@ class PdfViewerApp:
         self.tab_counters[base_title] = current
         return base_title if current == 1 else f"{base_title} ({current})"
 
+    def _close_current_tab(self) -> None:
+        selected = self.notebook.select()
+        if not selected:
+            return
+        try:
+            widget = self.notebook.nametowidget(selected)
+        except Exception:
+            return
+        if widget is self._home_tab:
+            return
+        cache_path = getattr(widget, "_pdf_cache_path", None)
+        try:
+            self.notebook.forget(widget)
+        except Exception:
+            return
+        if cache_path:
+            try:
+                Path(str(cache_path)).unlink(missing_ok=True)
+            except OSError:
+                pass
+        remaining_tabs = self.notebook.tabs()
+        if remaining_tabs:
+            self.notebook.select(remaining_tabs[-1])
+        elif self._home_tab is not None:
+            self.notebook.select(self._home_tab)
+
     def open_pdf(self, pdf_path: Path, title: str | None = None) -> None:
         pdf_path = pdf_path.resolve()
         if not pdf_path.exists():
@@ -119,6 +150,7 @@ class PdfViewerApp:
 
         tab_title = self._unique_tab_title(title or pdf_path.stem)
         frame = ttk.Frame(self.notebook)
+        setattr(frame, "_pdf_cache_path", str(pdf_path))
         self.notebook.add(frame, text=tab_title)
         self.notebook.select(frame)
 

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
+import time
 import tempfile
 import threading
 import uuid
@@ -12,8 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 import zipfile
+from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -25,9 +28,22 @@ from main import (
     collect_pending_case_rows,
     consult_case,
     consult_history_only,
+    emit_log,
+    extract_rows_from_table,
+    extract_tables_from_html_source,
+    extract_popup_frame_src,
+    open_cartola_bco_estado_popup_from_litigantes,
     create_driver,
+    fetch_session_resource_text,
     download_session_resource,
     login_to_sitfa,
+    resolve_litigantes_popup_url,
+    snapshot_window_urls,
+    wait_for_window_content,
+    wait_for_window_update,
+    wait_for_ready,
+    normalize_header_name,
+    normalize_litigantes_value,
 )
 
 
@@ -42,6 +58,7 @@ SESSION_STORE_LOCK = threading.Lock()
 class LoginPayload(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
+    headless: bool = True
 
 
 class ConsultPayload(BaseModel):
@@ -52,13 +69,34 @@ class HistoryDetailPayload(BaseModel):
     rit: str = Field(min_length=1)
 
 
+class SelectLitigantePayload(BaseModel):
+    litigante: dict[str, Any] = Field(default_factory=dict)
+
+
+class CartolaConsultPayload(BaseModel):
+    account: str = ""
+    start_date: str = ""
+    end_date: str = ""
+
+
 class OpenPdfPayload(BaseModel):
     pdf_url: str = Field(min_length=1)
     prefix: str = "pdf"
+    pdf_title: str = ""
+
+
+class ClosePdfPayload(BaseModel):
+    pdf_id: str = ""
 
 
 @dataclass
 class PdfArtifact:
+    path: Path
+    display_name: str
+
+
+@dataclass
+class CartolaExcelArtifact:
     path: Path
     display_name: str
 
@@ -82,27 +120,80 @@ class WebState:
     detail_rit: str = ""
     detail_rows: list[dict] = field(default_factory=list)
     detail_status: str = ""
+    selected_litigante: dict[str, Any] | None = None
     pdf_files: dict[str, PdfArtifact] = field(default_factory=dict)
     cached_pdf_files: dict[str, Path] = field(default_factory=dict)
     current_pdf_id: str = ""
+    cartola_excel_files: dict[str, CartolaExcelArtifact] = field(default_factory=dict)
+    current_cartola_excel_id: str = ""
+    cartola_window_handle: str = ""
+    cartola_popup_url: str = ""
+    cartola_data: dict[str, Any] = field(default_factory=dict)
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         self.logs.append(f"[{stamp}] {message}")
         self.logs = self.logs[-300:]
 
-    def clear_pdf(self) -> None:
-        if self.current_pdf_id:
-            artifact = self.pdf_files.pop(self.current_pdf_id, None)
+    def clear_pdf(self, pdf_id: str | None = None) -> None:
+        target_id = (pdf_id or self.current_pdf_id).strip()
+        if not target_id:
+            return
+
+        artifact = self.pdf_files.pop(target_id, None)
+        if artifact is not None:
+            try:
+                artifact.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if self.current_pdf_id == target_id:
+            self.current_pdf_id = next(reversed(self.pdf_files), "")
+
+    def clear_all_pdfs(self) -> None:
+        for pdf_id in list(self.pdf_files.keys()):
+            artifact = self.pdf_files.pop(pdf_id, None)
             if artifact is not None:
                 try:
                     artifact.path.unlink(missing_ok=True)
                 except OSError:
                     pass
-            self.current_pdf_id = ""
+        self.current_pdf_id = ""
+
+    def clear_cartola_excel(self, excel_id: str | None = None) -> None:
+        target_id = (excel_id or self.current_cartola_excel_id).strip()
+        if not target_id:
+            return
+
+        artifact = self.cartola_excel_files.pop(target_id, None)
+        if artifact is not None:
+            try:
+                artifact.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if self.current_cartola_excel_id == target_id:
+            self.current_cartola_excel_id = next(reversed(self.cartola_excel_files), "")
+
+    def clear_all_cartola_excels(self) -> None:
+        for excel_id in list(self.cartola_excel_files.keys()):
+            artifact = self.cartola_excel_files.pop(excel_id, None)
+            if artifact is not None:
+                try:
+                    artifact.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self.current_cartola_excel_id = ""
+
+    def reset_cartola(self) -> None:
+        self.clear_all_cartola_excels()
+        self.cartola_window_handle = ""
+        self.cartola_popup_url = ""
+        self.cartola_data = {}
 
     def reset_session(self) -> None:
-        self.clear_pdf()
+        self.clear_all_pdfs()
+        self.reset_cartola()
         self.authenticated = False
         self.username = ""
         self.current_rit = ""
@@ -115,6 +206,7 @@ class WebState:
         self.detail_rit = ""
         self.detail_rows = []
         self.detail_status = ""
+        self.selected_litigante = None
 
     def shutdown(self) -> None:
         with self.lock:
@@ -130,9 +222,9 @@ class WebState:
     def cleanup_session_files(self) -> None:
         cache_dir = get_session_cache_dir(self.session_id)
         shutil.rmtree(cache_dir, ignore_errors=True)
-        self.pdf_files.clear()
+        self.clear_all_pdfs()
+        self.reset_cartola()
         self.cached_pdf_files.clear()
-        self.current_pdf_id = ""
 
 
 def get_or_create_state(session_id: str) -> WebState:
@@ -368,6 +460,844 @@ def prepare_pdf_artifact(state: WebState, driver: Any, resource_url: str, prefix
     return PdfArtifact(path=active_path, display_name=display_name)
 
 
+def _column_name(index: int) -> str:
+    name = ""
+    n = index
+    while n >= 0:
+        n, remainder = divmod(n, 26)
+        name = chr(65 + remainder) + name
+        n -= 1
+    return name
+
+
+def build_cartola_xlsx_bytes(rows: list[dict[str, Any]], title: str = "Cartola Banco Estado") -> bytes:
+    headers = ["Fecha", "Tipo movimiento", "Monto"]
+    sheet_rows: list[list[str]] = [headers]
+    for row in rows:
+        sheet_rows.append([str(row.get(header, "") or "") for header in headers])
+
+    rows_xml: list[str] = []
+    for row_index, row_values in enumerate(sheet_rows, start=1):
+        cells_xml: list[str] = []
+        for col_index, value in enumerate(row_values):
+            cell_ref = f"{_column_name(col_index)}{row_index}"
+            cells_xml.append(
+                f'<c r="{cell_ref}" t="inlineStr"><is><t xml:space="preserve">{xml_escape(value)}</t></is></c>'
+            )
+        rows_xml.append(f'<row r="{row_index}">{"".join(cells_xml)}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(rows_xml)}</sheetData>'
+        '</worksheet>'
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name="{xml_escape(title)}" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+
+    root_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types_xml)
+        archive.writestr("_rels/.rels", root_rels_xml)
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buffer.getvalue()
+
+
+def build_cartola_xls_bytes(
+    rows: list[dict[str, Any]],
+    title: str = "Banco Estado",
+    account: str = "",
+    rut: str = "",
+    start_date: str = "",
+    end_date: str = "",
+) -> bytes:
+    summary_parts = []
+    if account:
+        summary_parts.append(f"LAV: {account}")
+    if rut:
+        summary_parts.append(f"RUT: {rut}")
+    period_text = ""
+    if start_date or end_date:
+        period_text = f"Movimientos desde {start_date or '-'} hasta {end_date or '-'}"
+
+    row_html: list[str] = []
+    for row in rows:
+        fecha = xml_escape(str(row.get("Fecha", "") or ""))
+        movimiento = xml_escape(str(row.get("Tipo movimiento", "") or ""))
+        monto = xml_escape(str(row.get("Monto", "") or ""))
+        row_html.append(
+            "<tr>"
+            f"<td>{fecha}</td>"
+            f"<td>{movimiento}</td>"
+            f"<td style=\"mso-number-format:'\\#\\,\\#\\#0'; text-align:right;\">{monto}</td>"
+            "</tr>"
+        )
+
+    summary_html = "".join(f"<div>{xml_escape(part)}</div>" for part in summary_parts)
+    if period_text:
+        summary_html += f"<div>{xml_escape(period_text)}</div>"
+
+    html = (
+        "<html>"
+        "<head>"
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />'
+        f"<title>{xml_escape(title)}</title>"
+        "</head>"
+        "<body>"
+        f"<h3>{xml_escape(title)}</h3>"
+        f"{summary_html}"
+        "<table border='1'>"
+        "<tr><th>Fecha</th><th>Tipo movimiento</th><th>Monto</th></tr>"
+        f"{''.join(row_html)}"
+        "</table>"
+        "</body>"
+        "</html>"
+    )
+    return html.encode("utf-8")
+
+
+def is_cartola_debug_enabled() -> bool:
+    return os.getenv("SITFA_DEBUG_CARTOLA", "").strip() == "1"
+
+
+def _safe_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _safe_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_json(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def collect_cartola_debug_snapshot(driver: Any) -> dict[str, Any]:
+    try:
+        return driver.execute_script(
+            """
+            function frameInfo(frame, index) {
+                var info = {
+                    index: index + 1,
+                    tag: frame.tagName || '',
+                    id: frame.id || '',
+                    name: frame.name || '',
+                    src: frame.getAttribute('src') || '',
+                    accessible: false,
+                    title: '',
+                    html: '',
+                    html_len: 0,
+                    error: ''
+                };
+                try {
+                    var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+                    if (doc) {
+                        var html = doc.documentElement ? doc.documentElement.outerHTML : (doc.body ? doc.body.outerHTML : '');
+                        info.accessible = true;
+                        info.title = doc.title || '';
+                        info.html = html || '';
+                        info.html_len = info.html.length;
+                    }
+                } catch (err) {
+                    info.error = String(err || '');
+                }
+                return info;
+            }
+
+            var frames = Array.prototype.slice.call(document.getElementsByTagName('frame')).concat(
+                Array.prototype.slice.call(document.getElementsByTagName('iframe'))
+            );
+            var html = document.documentElement ? document.documentElement.outerHTML : (document.body ? document.body.outerHTML : '');
+            return {
+                url: String(window.location.href || ''),
+                title: String(document.title || ''),
+                ready_state: String(document.readyState || ''),
+                html: html || '',
+                html_len: (html || '').length,
+                frame_count: frames.length,
+                frames: frames.map(frameInfo)
+            };
+            """
+        ) or {}
+    except Exception as exc:
+        return {
+            "url": "",
+            "title": "",
+            "ready_state": "",
+            "html": "",
+            "html_len": 0,
+            "frame_count": 0,
+            "frames": [],
+            "error": str(exc),
+        }
+
+
+def write_cartola_debug_dump(driver: Any, context: dict[str, Any] | None = None) -> Path:
+    dump_dir = Path("debug_dumps") / f"cartola_{time.strftime('%Y%m%d_%H%M%S')}"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot = collect_cartola_debug_snapshot(driver)
+    manifest = {
+        "created_at": datetime.now().isoformat(),
+        "snapshot": _safe_json(snapshot),
+        "context": _safe_json(context or {}),
+    }
+
+    try:
+        driver.save_screenshot(str(dump_dir / "window.png"))
+    except Exception as exc:
+        manifest["screenshot_error"] = str(exc)
+
+    try:
+        main_html = str(snapshot.get("html") or driver.page_source or "")
+    except Exception as exc:
+        main_html = ""
+        manifest["main_html_error"] = str(exc)
+    (dump_dir / "main_document.html").write_text(main_html, encoding="utf-8", errors="replace")
+
+    for frame in snapshot.get("frames") or []:
+        frame_index = int(frame.get("index") or 0)
+        frame_label = f"frame_{frame_index:02d}"
+        frame_html = str(frame.get("html") or "")
+        if frame_html:
+            (dump_dir / f"{frame_label}.html").write_text(frame_html, encoding="utf-8", errors="replace")
+
+    (dump_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+        errors="replace",
+    )
+    return dump_dir
+
+
+def empty_cartola_data() -> dict[str, Any]:
+    return {
+        "open": False,
+        "window_url": "",
+        "title": "",
+        "accounts": [],
+        "selected_account": "",
+        "start_date": "",
+        "end_date": "",
+        "movements": [],
+        "can_consult": False,
+        "can_export": False,
+    }
+
+
+def switch_to_cartola_window(state: WebState, driver: Any) -> str:
+    handle = (state.cartola_window_handle or "").strip()
+    if not handle:
+        raise RuntimeError("La cartola no está abierta")
+
+    handles = set(driver.window_handles)
+    if handle not in handles:
+        state.reset_cartola()
+        raise RuntimeError("La ventana de cartola ya no está disponible")
+
+    previous_handle = driver.current_window_handle
+    driver.switch_to.window(handle)
+    driver.switch_to.default_content()
+    wait_for_ready(driver, timeout=8)
+    return previous_handle
+
+
+def close_existing_cartola_window(state: WebState, driver: Any, log_callback=None) -> None:
+    handle = (state.cartola_window_handle or "").strip()
+    if not handle:
+        state.reset_cartola()
+        return
+
+    try:
+        handles = set(driver.window_handles)
+    except WebDriverException:
+        state.reset_cartola()
+        return
+
+    if handle not in handles:
+        state.reset_cartola()
+        return
+
+    try:
+        current_handle = driver.current_window_handle
+    except WebDriverException:
+        current_handle = ""
+
+    try:
+        driver.switch_to.window(handle)
+        driver.close()
+        emit_log(log_callback, "Cartola: ventana anterior cerrada")
+    except WebDriverException as exc:
+        emit_log(log_callback, "Cartola: no se pudo cerrar la ventana anterior: " + str(exc))
+    finally:
+        state.reset_cartola()
+        remaining_handles = []
+        try:
+            remaining_handles = list(driver.window_handles)
+        except WebDriverException:
+            remaining_handles = []
+        target_handle = current_handle if current_handle in remaining_handles else (remaining_handles[-1] if remaining_handles else "")
+        if target_handle:
+            try:
+                driver.switch_to.window(target_handle)
+                driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+
+
+def read_cartola_payload(driver: Any) -> dict[str, Any]:
+    form_data = _cartola_form_probe(driver)
+    if not form_data.get("ok"):
+        raise RuntimeError("No se pudo leer el formulario de cartola")
+
+    html_source = driver.page_source or ""
+    movements = extract_cartola_movements_from_html(html_source)
+    return {
+        "open": True,
+        "window_url": str(form_data.get("url") or getattr(driver, "current_url", "") or ""),
+        "title": str(form_data.get("title") or ""),
+        "accounts": form_data.get("cuentas") or [],
+        "selected_account": str(form_data.get("cuenta_actual") or ""),
+        "start_date": str(form_data.get("fec_inicio") or ""),
+        "end_date": str(form_data.get("fec_fin") or ""),
+        "movements": movements,
+        "can_consult": bool(form_data.get("tiene_consulta")),
+        "can_export": bool(form_data.get("tiene_excel")),
+    }
+
+
+def apply_cartola_filters_and_consult(
+    driver: Any,
+    account: str,
+    start_date: str,
+    end_date: str,
+    log_callback=None,
+) -> dict[str, Any]:
+    emit_log(
+        log_callback,
+        "Cartola: aplicando filtros "
+        + f"cuenta={account or '(actual)'} "
+        + f"desde={start_date or '(sin cambio)'} "
+        + f"hasta={end_date or '(sin cambio)'}",
+    )
+    result = driver.execute_script(
+        """
+        var accountValue = String(arguments[0] || '');
+        var startValue = String(arguments[1] || '');
+        var endValue = String(arguments[2] || '');
+
+        function applyAndSubmit(doc) {
+            var form = doc.forms && doc.forms["TramitarPpalForm"];
+            if (!form) {
+                return null;
+            }
+            var select = form.elements["NRO_Cuenta"];
+            var start = form.elements["FEC_Inicio"];
+            var end = form.elements["FEC_Fin"];
+            if (select && accountValue) {
+                for (var i = 0; i < select.options.length; i++) {
+                    if (String(select.options[i].value || '') === accountValue) {
+                        select.selectedIndex = i;
+                        break;
+                    }
+                }
+            }
+            if (start && startValue) {
+                start.removeAttribute('readonly');
+                start.value = startValue;
+            }
+            if (end && endValue) {
+                end.removeAttribute('readonly');
+                end.value = endValue;
+            }
+
+            var button = Array.prototype.slice.call(form.querySelectorAll('input[type="submit"], input[type="button"], button')).find(function (el) {
+                return String(el.value || el.textContent || '').replace(/\\s+/g, ' ').trim() === 'Cons. movimientos';
+            });
+            if (button) {
+                if (typeof button.click === 'function') {
+                    button.click();
+                } else {
+                    button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                }
+                return { ok: true, mode: 'button' };
+            }
+            if (form && typeof form.submit === 'function') {
+                form.submit();
+                return { ok: true, mode: 'submit' };
+            }
+            return { ok: false, mode: 'not_found' };
+        }
+
+        var applied = applyAndSubmit(document);
+        if (applied) {
+            return applied;
+        }
+
+        var frames = Array.prototype.slice.call(document.getElementsByTagName('frame')).concat(Array.prototype.slice.call(document.getElementsByTagName('iframe')));
+        for (var i = 0; i < frames.length; i++) {
+            try {
+                var doc = frames[i].contentDocument || (frames[i].contentWindow && frames[i].contentWindow.document);
+                var frameApplied = doc ? applyAndSubmit(doc) : null;
+                if (frameApplied) {
+                    frameApplied.scope = 'frame:' + (i + 1);
+                    return frameApplied;
+                }
+            } catch (_err) {}
+        }
+        return { ok: false, mode: 'form_not_found' };
+        """,
+        account,
+        start_date,
+        end_date,
+    ) or {}
+    emit_log(log_callback, "Cartola: resultado consultar=" + json.dumps(_safe_json(result), ensure_ascii=False))
+    if not result.get("ok"):
+        raise RuntimeError("No se pudo ejecutar Cons. movimientos")
+
+    time.sleep(0.8)
+    wait_for_ready(driver, timeout=8)
+    return read_cartola_payload(driver)
+
+
+def _cartola_form_probe(driver: Any) -> dict[str, Any]:
+    return driver.execute_script(
+        """
+        function probeInDoc(doc) {
+            var form = doc.forms && doc.forms["TramitarPpalForm"];
+            if (!form) {
+                return null;
+            }
+            var select = form.elements["NRO_Cuenta"];
+            var start = form.elements["FEC_Inicio"];
+            var end = form.elements["FEC_Fin"];
+            var predet = Array.prototype.slice.call(form.querySelectorAll('input[type="submit"], input[type="button"]')).find(function (el) {
+                return String(el.value || '').trim() === 'Predet.';
+            });
+            var consult = Array.prototype.slice.call(form.querySelectorAll('input[type="submit"], input[type="button"]')).find(function (el) {
+                return String(el.value || '').trim() === 'Cons. movimientos';
+            });
+            var excelBtn = Array.prototype.slice.call(form.querySelectorAll('img, input, button, a')).find(function (el) {
+                var text = String(el.value || el.alt || el.title || el.getAttribute('name') || '');
+                return /excel/i.test(text) || /showexcel/i.test(String(el.getAttribute('onclick') || ''));
+            });
+            return {
+                ok: true,
+                cuentas: select ? Array.prototype.slice.call(select.options).map(function (opt) {
+                    return { value: opt.value, text: opt.text, selected: !!opt.selected };
+                }) : [],
+                cuenta_actual: select ? String(select.value || '') : '',
+                fec_inicio: start ? String(start.value || '') : '',
+                fec_fin: end ? String(end.value || '') : '',
+                tiene_predet: !!predet,
+                tiene_consulta: !!consult,
+                tiene_excel: !!excelBtn
+            };
+        }
+
+        function frameMeta(frame, index) {
+            var meta = {
+                index: index + 1,
+                tag: frame.tagName || '',
+                id: frame.id || '',
+                name: frame.name || '',
+                src: frame.getAttribute('src') || '',
+                accessible: false,
+                error: ''
+            };
+            try {
+                var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+                meta.accessible = !!doc;
+                if (doc) {
+                    meta.title = String(doc.title || '');
+                    meta.html_len = String((doc.documentElement && doc.documentElement.outerHTML) || '').length;
+                }
+            } catch (err) {
+                meta.error = String(err || '');
+            }
+            return meta;
+        }
+
+        var result = probeInDoc(document);
+        if (result) {
+            result.scope = 'document';
+            result.url = String(window.location.href || '');
+            result.title = String(document.title || '');
+            result.ready_state = String(document.readyState || '');
+            result.frame_count = document.getElementsByTagName('frame').length + document.getElementsByTagName('iframe').length;
+            result.html_len = String((document.documentElement && document.documentElement.outerHTML) || '').length;
+            return result;
+        }
+
+        var frames = Array.prototype.slice.call(document.getElementsByTagName('frame')).concat(Array.prototype.slice.call(document.getElementsByTagName('iframe')));
+        for (var i = 0; i < frames.length; i++) {
+            try {
+                var doc = frames[i].contentDocument || (frames[i].contentWindow && frames[i].contentWindow.document);
+                var probed = doc ? probeInDoc(doc) : null;
+                if (probed) {
+                    probed.scope = 'frame:' + (i + 1);
+                    probed.url = String(window.location.href || '');
+                    probed.title = String(document.title || '');
+                    probed.ready_state = String(document.readyState || '');
+                    probed.frame_count = frames.length;
+                    probed.html_len = String((document.documentElement && document.documentElement.outerHTML) || '').length;
+                    probed.frames = frames.map(frameMeta);
+                    return probed;
+                }
+            } catch (_err) {}
+        }
+
+        return {
+            ok: false,
+            reason: "no_form",
+            url: String(window.location.href || ''),
+            title: String(document.title || ''),
+            ready_state: String(document.readyState || ''),
+            frame_count: frames.length,
+            html_len: String((document.documentElement && document.documentElement.outerHTML) || '').length,
+            frames: frames.map(frameMeta)
+        };
+        """
+    ) or {}
+
+
+def extract_cartola_movements_from_html(source: str) -> list[dict[str, str]]:
+    wanted_headers = ["Fecha", "Tipo movimiento", "Monto"]
+    best_rows: list[dict[str, str]] = []
+    for table in extract_tables_from_html_source(source):
+        rows = extract_rows_from_table(table, wanted_headers)
+        if len(rows) > len(best_rows):
+            best_rows = rows
+    return best_rows
+
+
+def _resolve_cartola_popup_url(driver: Any, popup_url: str, log_callback=None) -> str:
+    resolved_url = str(popup_url or "").strip()
+    if not resolved_url:
+        return ""
+
+    emit_log(log_callback, f"Cartola: popup_url original -> {resolved_url}")
+    try:
+        content_type, popup_html = fetch_session_resource_text(driver, resolved_url)
+        emit_log(
+            log_callback,
+            f"Cartola: html popup capturado type={content_type or 'desconocido'} len={len(popup_html or '')}",
+        )
+        inner_src = extract_popup_frame_src(popup_html or "")
+        if inner_src:
+            resolved_url = urljoin(resolved_url, inner_src)
+            emit_log(log_callback, f"Cartola: frame interno resuelto -> {resolved_url}")
+        else:
+            emit_log(log_callback, "Cartola: popup sin frame interno, se usara la URL original")
+    except Exception as exc:
+        emit_log(log_callback, f"Cartola: no se pudo resolver frame interno: {exc}")
+
+    return resolved_url
+
+
+def cartola_popup_select_account_and_consult(driver: Any, log_callback=None) -> dict[str, Any]:
+    emit_log(log_callback, "Cartola: leyendo formulario del popup")
+    form_data = {}
+    for attempt in range(6):
+        form_data = _cartola_form_probe(driver)
+        if form_data.get("ok"):
+            emit_log(
+                log_callback,
+                "Cartola: formulario encontrado "
+                + f"scope={form_data.get('scope', '')} "
+                + f"url={form_data.get('url', '')} "
+                + f"title={form_data.get('title', '')!r} "
+                + f"frames={form_data.get('frame_count', 0)}",
+            )
+            break
+        emit_log(
+            log_callback,
+            "Cartola: formulario no encontrado, "
+            + f"reintento {attempt + 1}/6 "
+            + f"url={form_data.get('url', '')} "
+            + f"title={form_data.get('title', '')!r} "
+            + f"frames={form_data.get('frame_count', 0)} "
+            + f"html_len={form_data.get('html_len', 0)}",
+        )
+        frame_summaries = []
+        for frame in form_data.get("frames") or []:
+            frame_summaries.append(
+                f"{frame.get('index')}:{frame.get('tag') or 'frame'}"
+                + f" name={frame.get('name') or ''}"
+                + f" id={frame.get('id') or ''}"
+                + f" src={frame.get('src') or ''}"
+                + f" accessible={frame.get('accessible')}"
+            )
+        if frame_summaries:
+            emit_log(log_callback, "Cartola: frames detectados -> " + " || ".join(frame_summaries[:10]))
+        try:
+            frame_count = len(driver.find_elements("tag name", "frame")) + len(driver.find_elements("tag name", "iframe"))
+            emit_log(
+                log_callback,
+                f"Cartola: url_actual={getattr(driver, 'current_url', '')} frames={frame_count}",
+            )
+            emit_log(log_callback, f"Cartola: html_visible_len={len(driver.page_source or '')}")
+        except Exception:
+            pass
+        time.sleep(0.8)
+
+    if not form_data.get("ok"):
+        dump_dir = None
+        if is_cartola_debug_enabled():
+            dump_dir = write_cartola_debug_dump(
+                driver,
+                context={
+                    "stage": "form_not_found",
+                    "form_probe": form_data,
+                },
+            )
+            emit_log(log_callback, f"Cartola: dump de debug generado en {dump_dir}")
+        detail = (
+            "No se encontro el formulario de cartola"
+            + f" | url={form_data.get('url', '')}"
+            + f" | frames={form_data.get('frame_count', 0)}"
+        )
+        if dump_dir is not None:
+            detail += f" | dump={dump_dir}"
+        raise RuntimeError(detail)
+
+    cuentas = form_data.get("cuentas") or []
+    emit_log(log_callback, f"Cartola: cuentas disponibles={cuentas}")
+    if not cuentas:
+        dump_dir = None
+        if is_cartola_debug_enabled():
+            dump_dir = write_cartola_debug_dump(
+                driver,
+                context={
+                    "stage": "no_accounts",
+                    "form_probe": form_data,
+                },
+            )
+            emit_log(log_callback, f"Cartola: dump de debug generado en {dump_dir}")
+        detail = "No hay cuentas disponibles en la cartola"
+        if dump_dir is not None:
+            detail += f" | dump={dump_dir}"
+        raise RuntimeError(detail)
+
+    selected_account = cuentas[0].get("value", "")
+    emit_log(log_callback, f"Cartola: seleccionando cuenta={selected_account}")
+    driver.execute_script(
+        """
+        var accountValue = arguments[0];
+        function applyToDoc(doc) {
+            var form = doc.forms && doc.forms["TramitarPpalForm"];
+            if (!form) {
+                return false;
+            }
+            var select = form.elements["NRO_Cuenta"];
+            if (!select) {
+                return false;
+            }
+            for (var i = 0; i < select.options.length; i++) {
+                if (String(select.options[i].value || '') === String(accountValue || '')) {
+                    select.selectedIndex = i;
+                    break;
+                }
+            }
+            if (typeof select.onchange === 'function') {
+                try { select.onchange(); } catch (_err) {}
+            }
+            return true;
+        }
+        if (!applyToDoc(document)) {
+            var frames = Array.prototype.slice.call(document.getElementsByTagName('frame')).concat(Array.prototype.slice.call(document.getElementsByTagName('iframe')));
+            for (var i = 0; i < frames.length; i++) {
+                try {
+                    var doc = frames[i].contentDocument || (frames[i].contentWindow && frames[i].contentWindow.document);
+                    if (doc && applyToDoc(doc)) {
+                        break;
+                    }
+                } catch (_err) {}
+            }
+        }
+        """,
+        selected_account,
+    )
+
+    before_urls = snapshot_window_urls(driver)
+    emit_log(log_callback, "Cartola: clic en Predet.")
+    predet_clicked = driver.execute_script(
+        """
+        function clickButton(doc, label) {
+            var form = doc.forms && doc.forms["TramitarPpalForm"];
+            if (!form) {
+                return false;
+            }
+            var button = Array.prototype.slice.call(form.querySelectorAll('input[type="submit"], input[type="button"]')).find(function (el) {
+                return String(el.value || '').trim() === label;
+            });
+            if (!button) {
+                return false;
+            }
+            if (typeof button.click === 'function') {
+                button.click();
+            } else {
+                button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            }
+            return true;
+        }
+        if (!clickButton(document, 'Predet.')) {
+            var frames = Array.prototype.slice.call(document.getElementsByTagName('frame')).concat(Array.prototype.slice.call(document.getElementsByTagName('iframe')));
+            for (var i = 0; i < frames.length; i++) {
+                try {
+                    var doc = frames[i].contentDocument || (frames[i].contentWindow && frames[i].contentWindow.document);
+                    if (doc && clickButton(doc, 'Predet.')) {
+                        break;
+                    }
+                } catch (_err) {}
+            }
+        }
+        return false;
+        """
+    )
+    emit_log(log_callback, f"Cartola: resultado clic Predet.={bool(predet_clicked)}")
+    if not predet_clicked and is_cartola_debug_enabled():
+        dump_dir = write_cartola_debug_dump(
+            driver,
+            context={
+                "stage": "predet_click_failed",
+                "form_probe": form_data,
+            },
+        )
+        emit_log(log_callback, f"Cartola: dump de debug generado en {dump_dir}")
+    wait_for_window_update(driver, before_urls, timeout=8.0, verbose=False)
+    wait_for_window_content(driver, timeout=8)
+    wait_for_ready(driver, timeout=8)
+
+    before_urls = snapshot_window_urls(driver)
+    emit_log(log_callback, "Cartola: clic en Cons. movimientos")
+    consult_clicked = driver.execute_script(
+        """
+        function clickButton(doc, label) {
+            var form = doc.forms && doc.forms["TramitarPpalForm"];
+            if (!form) {
+                return false;
+            }
+            var button = Array.prototype.slice.call(form.querySelectorAll('input[type="submit"], input[type="button"]')).find(function (el) {
+                return String(el.value || '').trim() === label;
+            });
+            if (!button) {
+                return false;
+            }
+            if (typeof button.click === 'function') {
+                button.click();
+            } else {
+                button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            }
+            return true;
+        }
+        if (!clickButton(document, 'Cons. movimientos')) {
+            var frames = Array.prototype.slice.call(document.getElementsByTagName('frame')).concat(Array.prototype.slice.call(document.getElementsByTagName('iframe')));
+            for (var i = 0; i < frames.length; i++) {
+                try {
+                    var doc = frames[i].contentDocument || (frames[i].contentWindow && frames[i].contentWindow.document);
+                    if (doc && clickButton(doc, 'Cons. movimientos')) {
+                        break;
+                    }
+                } catch (_err) {}
+            }
+        }
+        return false;
+        """
+    )
+    emit_log(log_callback, f"Cartola: resultado clic Cons. movimientos={bool(consult_clicked)}")
+    if not consult_clicked and is_cartola_debug_enabled():
+        dump_dir = write_cartola_debug_dump(
+            driver,
+            context={
+                "stage": "consult_click_failed",
+                "form_probe": form_data,
+            },
+        )
+        emit_log(log_callback, f"Cartola: dump de debug generado en {dump_dir}")
+    wait_for_window_update(driver, before_urls, timeout=8.0, verbose=False)
+    wait_for_window_content(driver, timeout=8)
+    wait_for_ready(driver, timeout=8)
+
+    html_source = driver.page_source or ""
+    movements = extract_cartola_movements_from_html(html_source)
+    emit_log(log_callback, f"Cartola: movimientos extraidos={len(movements)}")
+    if not movements and is_cartola_debug_enabled():
+        dump_dir = write_cartola_debug_dump(
+            driver,
+            context={
+                "stage": "no_movements_after_consult",
+                "form_probe": form_data,
+                "selected_account": selected_account,
+                "predet_clicked": bool(predet_clicked),
+                "consult_clicked": bool(consult_clicked),
+            },
+        )
+        emit_log(log_callback, f"Cartola: sin movimientos, dump de debug en {dump_dir}")
+    return {
+        "account": selected_account,
+        "movements": movements,
+        "html": html_source,
+        "raw_form": form_data,
+    }
+
+
+def prepare_cartola_excel_artifact(state: WebState, movements: list[dict[str, Any]]) -> CartolaExcelArtifact:
+    cache_dir = get_session_cache_dir(state.session_id)
+    account = str((state.cartola_data or {}).get("selected_account") or "")
+    start_date = str((state.cartola_data or {}).get("start_date") or "")
+    end_date = str((state.cartola_data or {}).get("end_date") or "")
+    rut = ""
+    if state.selected_litigante:
+        rut = str(state.selected_litigante.get("Rut/Pasaporte") or "")
+    excel_bytes = build_cartola_xls_bytes(
+        movements,
+        title="Banco Estado",
+        account=account,
+        rut=rut,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    excel_id = uuid.uuid4().hex
+    active_dir = cache_dir / "active"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    active_path = active_dir / f"cartola_{excel_id}.xls"
+    active_path.write_bytes(excel_bytes)
+    base_name = (state.username or "cartola").strip() or "cartola"
+    safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in base_name)
+    return CartolaExcelArtifact(path=active_path, display_name=f"{safe_name}_BancoEstado.xls")
+
+
 def ensure_driver(state: WebState, headless: bool) -> None:
     if state.driver is not None and state.headless == headless:
         return
@@ -379,8 +1309,9 @@ def ensure_driver(state: WebState, headless: bool) -> None:
             pass
         state.driver = None
 
-    state.append_log("Creando driver con Edge " + ("headless" if headless else "visible"))
-    state.driver = create_driver(initial_url=LOGIN_URL, browser="edge", headless=headless)
+    browser = os.getenv("SITFA_WEB_BROWSER", os.getenv("SITFA_BROWSER", "edge")).strip().lower() or "edge"
+    state.append_log(f"Creando driver con {browser.upper()} " + ("headless" if headless else "visible"))
+    state.driver = create_driver(initial_url=LOGIN_URL, browser=browser, headless=headless)
     state.headless = headless
     state.authenticated = False
 
@@ -451,7 +1382,8 @@ def render_table(rows: list[dict]) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return HTML_PAGE
+    default_headless = os.getenv("SITFA_WEB_HEADLESS", "1").strip() != "0"
+    return HTML_PAGE.replace("__DEFAULT_HEADLESS__", "true" if default_headless else "false")
 
 
 @app.get("/api/health")
@@ -477,6 +1409,8 @@ def status(request: Request, response: Response) -> dict[str, Any]:
         "detail_rit": state.detail_rit,
         "detail_rows": state.detail_rows,
         "detail_status": state.detail_status,
+        "selected_litigante": state.selected_litigante,
+        "cartola": state.cartola_data or empty_cartola_data(),
         "current_pdf_url": "/api/pdf/" + state.current_pdf_id if state.current_pdf_id else "",
     }
 
@@ -486,7 +1420,7 @@ def api_login(payload: LoginPayload, request: Request, response: Response) -> di
     state = get_session_state(request, response)
     with state.lock:
         try:
-            ensure_driver(state, True)
+            ensure_driver(state, payload.headless)
             state.append_log("Solicitud de login enviada")
             login_to_sitfa(state.driver, payload.username, payload.password, log_callback=state.append_log)
             state.username = payload.username
@@ -495,6 +1429,8 @@ def api_login(payload: LoginPayload, request: Request, response: Response) -> di
             state.detail_rit = ""
             state.detail_rows = []
             state.detail_status = ""
+            state.selected_litigante = None
+            state.reset_cartola()
             state.authenticated = True
             state.pending_rows = []
             state.pending_status = "Pendientes sin cargar"
@@ -533,8 +1469,8 @@ def api_consult(payload: ConsultPayload, request: Request, response: Response) -
     state = get_session_state(request, response)
     with state.lock:
         driver = require_session(state)
+        close_existing_cartola_window(state, driver, log_callback=state.append_log)
         state.append_log("Consulta enviada para " + payload.rit)
-        state.clear_pdf()
         state.progress_value = 0.0
         state.progress_status = "Iniciando consulta"
         results = consult_case(
@@ -556,7 +1492,275 @@ def api_consult(payload: ConsultPayload, request: Request, response: Response) -
         state.detail_rit = ""
         state.detail_rows = []
         state.detail_status = ""
+        state.selected_litigante = None
+        state.reset_cartola()
         return {"ok": True, "rit": payload.rit, "results": results}
+
+
+@app.post("/api/select-litigante")
+def api_select_litigante(payload: SelectLitigantePayload, request: Request, response: Response) -> dict[str, Any]:
+    state = get_session_state(request, response)
+    with state.lock:
+        driver = require_session(state)
+        litigante = payload.litigante or {}
+        close_existing_cartola_window(state, driver, log_callback=state.append_log)
+        state.selected_litigante = litigante
+        label = str(litigante.get("Sujeto") or litigante.get("Nombre o Razón Social") or litigante.get("Rut/Pasaporte") or "").strip()
+        state.append_log("Litigante seleccionado: " + (label or "sin dato"))
+        return {"ok": True, "selected_litigante": litigante}
+
+
+@app.post("/api/cartola-bco-estado")
+def api_cartola_bco_estado(request: Request, response: Response) -> dict[str, Any]:
+    state = get_session_state(request, response)
+    with state.lock:
+        driver = require_session(state)
+        close_existing_cartola_window(state, driver, log_callback=state.append_log)
+        if not state.selected_litigante:
+            raise HTTPException(status_code=400, detail="Primero selecciona un litigante en la pestaña Litigantes")
+
+        try:
+            selected_label = str(
+                state.selected_litigante.get("Sujeto")
+                or state.selected_litigante.get("Nombre o Razón Social")
+                or state.selected_litigante.get("Rut/Pasaporte")
+                or ""
+            ).strip()
+            state.append_log("Cartola: solicitud recibida para " + (selected_label or "sin dato"))
+            state.status = "Buscando litigantes..."
+            state.progress_status = "Resolviendo ventana Litigantes"
+            state.progress_value = 25.0
+
+            popup_url = resolve_litigantes_popup_url(driver, log_callback=state.append_log)
+            if not popup_url:
+                raise HTTPException(status_code=400, detail="No se pudo resolver la ventana de Litigantes")
+            state.append_log("Cartola: popup de Litigantes resuelto -> " + popup_url)
+            state.status = "Seleccionando litigante..."
+            state.progress_status = "Seleccionando litigante"
+            state.progress_value = 50.0
+
+            popup_url, reason = open_cartola_bco_estado_popup_from_litigantes(
+                driver,
+                selected_litigante=state.selected_litigante,
+                litigantes_popup_url=popup_url,
+                log_callback=state.append_log,
+            )
+        except Exception as exc:
+            state.append_log("Cartola: " + str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if not popup_url:
+            detail = "No se pudo abrir Cartola bco.estado"
+            if reason:
+                detail += " (" + reason + ")"
+            raise HTTPException(status_code=400, detail=detail)
+
+        popup_url = urljoin(driver.current_url, popup_url)
+        popup_url = _resolve_cartola_popup_url(driver, popup_url, log_callback=state.append_log)
+        state.append_log("Cartola: URL capturada -> " + popup_url)
+        state.status = "Abriendo Cartola bco.estado..."
+        state.progress_status = "Abriendo Cartola bco.estado"
+        state.progress_value = 75.0
+
+        try:
+            original_handle = driver.current_window_handle
+            before_handles = set(driver.window_handles)
+            state.append_log(
+                "Cartola: handles antes de abrir="
+                + str(len(before_handles))
+                + " url_actual="
+                + str(getattr(driver, "current_url", ""))
+            )
+            driver.execute_script("window.open(arguments[0], '_blank');", popup_url)
+            opened_handle = ""
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                current_handles = set(driver.window_handles)
+                new_handles = list(current_handles - before_handles)
+                if new_handles:
+                    opened_handle = new_handles[0]
+                    break
+                time.sleep(0.1)
+            try:
+                state.append_log("Cartola: handles despues de abrir=" + str(len(driver.window_handles)))
+            except WebDriverException:
+                pass
+            if opened_handle:
+                try:
+                    driver.switch_to.window(opened_handle)
+                    state.cartola_window_handle = opened_handle
+                    state.cartola_popup_url = popup_url
+                    state.append_log("Cartola: ventana enfocada " + opened_handle)
+                    state.append_log("Cartola: url enfocada -> " + str(getattr(driver, "current_url", "")))
+                except WebDriverException as exc:
+                    state.append_log("Cartola: no se pudo enfocar la ventana nueva: " + str(exc))
+            else:
+                state.append_log("Cartola: no apareció una ventana nueva, se navega en la pestaña actual")
+                try:
+                    driver.get(popup_url)
+                    state.cartola_window_handle = driver.current_window_handle
+                    state.cartola_popup_url = popup_url
+                    state.append_log("Cartola: navegación directa realizada -> " + str(getattr(driver, "current_url", "")))
+                except WebDriverException as exc:
+                    raise HTTPException(status_code=400, detail="No se pudo cargar la Cartola bco.estado en la pestaña actual: " + str(exc)) from exc
+
+            wait_for_ready(driver, timeout=8)
+            try:
+                frame_count = len(driver.find_elements("tag name", "frame")) + len(driver.find_elements("tag name", "iframe"))
+                state.append_log("Cartola: frames visibles=" + str(frame_count))
+            except WebDriverException:
+                pass
+            if is_cartola_debug_enabled():
+                snapshot = collect_cartola_debug_snapshot(driver)
+                state.append_log(
+                    "Cartola: snapshot "
+                    + f"title={snapshot.get('title', '')!r} "
+                    + f"ready={snapshot.get('ready_state', '')} "
+                    + f"html_len={snapshot.get('html_len', 0)}"
+                )
+            state.cartola_data = read_cartola_payload(driver)
+            state.append_log(
+                "Cartola: panel cargado "
+                + f"cuentas={len(state.cartola_data.get('accounts') or [])} "
+                + f"movimientos={len(state.cartola_data.get('movements') or [])}"
+            )
+            try:
+                driver.switch_to.window(original_handle)
+                driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+            state.append_log("Cartola: datos trasladados a la app web")
+        except WebDriverException as exc:
+            detail = "No se pudo abrir la ventana de Cartola bco.estado: " + str(exc)
+            if is_cartola_debug_enabled():
+                dump_dir = write_cartola_debug_dump(
+                    driver,
+                    context={
+                        "stage": "endpoint_webdriver_exception",
+                        "popup_url": popup_url,
+                        "selected_litigante": state.selected_litigante,
+                        "error": str(exc),
+                    },
+                )
+                state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
+                detail += f" | dump={dump_dir}"
+            raise HTTPException(status_code=400, detail=detail) from exc
+        except Exception as exc:
+            detail = str(exc)
+            if is_cartola_debug_enabled():
+                dump_dir = write_cartola_debug_dump(
+                    driver,
+                    context={
+                        "stage": "endpoint_exception",
+                        "popup_url": popup_url,
+                        "selected_litigante": state.selected_litigante,
+                        "error": str(exc),
+                    },
+                )
+                state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
+                detail += f" | dump={dump_dir}"
+            raise HTTPException(status_code=400, detail=detail) from exc
+
+        state.status = "Cartola bco.estado abierta"
+        state.progress_status = "Cartola abierta"
+        state.progress_value = 100.0
+        return {
+            "ok": True,
+            "url": popup_url,
+            "selected_litigante": state.selected_litigante,
+            "cartola": state.cartola_data or empty_cartola_data(),
+        }
+
+
+@app.post("/api/cartola-consult")
+def api_cartola_consult(payload: CartolaConsultPayload, request: Request, response: Response) -> dict[str, Any]:
+    state = get_session_state(request, response)
+    with state.lock:
+        driver = require_session(state)
+        previous_handle = ""
+        try:
+            previous_handle = switch_to_cartola_window(state, driver)
+            state.status = "Consultando cartola..."
+            state.progress_status = "Consultando cartola"
+            state.progress_value = 80.0
+            state.cartola_data = apply_cartola_filters_and_consult(
+                driver,
+                account=payload.account.strip(),
+                start_date=payload.start_date.strip(),
+                end_date=payload.end_date.strip(),
+                log_callback=state.append_log,
+            )
+            state.append_log(
+                "Cartola: consulta actualizada "
+                + f"movimientos={len(state.cartola_data.get('movements') or [])}"
+            )
+        except Exception as exc:
+            detail = str(exc)
+            if is_cartola_debug_enabled():
+                dump_dir = write_cartola_debug_dump(
+                    driver,
+                    context={
+                        "stage": "cartola_consult",
+                        "payload": payload.model_dump(),
+                        "error": str(exc),
+                    },
+                )
+                state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
+                detail += f" | dump={dump_dir}"
+            raise HTTPException(status_code=400, detail=detail) from exc
+        finally:
+            if previous_handle:
+                try:
+                    driver.switch_to.window(previous_handle)
+                    driver.switch_to.default_content()
+                except WebDriverException:
+                    pass
+
+        state.status = "Cartola actualizada"
+        state.progress_status = "Cartola actualizada"
+        state.progress_value = 100.0
+        return {"ok": True, "cartola": state.cartola_data}
+
+
+@app.post("/api/cartola-export-xls")
+def api_cartola_export_xls(request: Request, response: Response) -> dict[str, Any]:
+    state = get_session_state(request, response)
+    with state.lock:
+        require_session(state)
+        cartola = state.cartola_data or {}
+        movements = cartola.get("movements") or []
+        if not cartola.get("open"):
+            raise HTTPException(status_code=400, detail="Primero abre la cartola")
+        if not movements:
+            raise HTTPException(status_code=400, detail="No hay movimientos para exportar")
+
+        excel_artifact = prepare_cartola_excel_artifact(state, movements)
+        excel_id = uuid.uuid4().hex
+        state.cartola_excel_files[excel_id] = excel_artifact
+        state.current_cartola_excel_id = excel_id
+        export_url = "/api/cartola-excel/" + excel_id
+        state.append_log("Cartola: archivo XLS generado -> " + export_url)
+        return {"ok": True, "url": export_url, "name": excel_artifact.display_name}
+
+
+@app.get("/api/cartola-excel/{excel_id}")
+def api_cartola_excel(excel_id: str, request: Request, response: Response) -> Response:
+    state = get_session_state(request, response)
+    with state.lock:
+        artifact = state.cartola_excel_files.get(excel_id)
+        if artifact is None or not artifact.path.exists():
+            raise HTTPException(status_code=404, detail="No existe el archivo Excel de cartola")
+
+        content = artifact.path.read_bytes()
+        filename = artifact.display_name or "Cartola_BancoEstado.xls"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        }
+        return Response(
+            content=content,
+            media_type="application/vnd.ms-excel",
+            headers=headers,
+        )
 
 
 @app.post("/api/case-history")
@@ -588,7 +1792,6 @@ def api_open_pdf(payload: OpenPdfPayload, request: Request, response: Response) 
         if not pdf_url:
             raise HTTPException(status_code=400, detail="La fila no tiene PDF asociado")
 
-        state.clear_pdf()
         try:
             artifact = prepare_pdf_artifact(state, driver, pdf_url, payload.prefix)
         except HTTPException:
@@ -596,19 +1799,27 @@ def api_open_pdf(payload: OpenPdfPayload, request: Request, response: Response) 
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        custom_title = payload.pdf_title.strip()
+        if custom_title:
+            artifact.display_name = custom_title
+
         pdf_id = uuid.uuid4().hex
         state.pdf_files[pdf_id] = artifact
         state.current_pdf_id = pdf_id
         state.append_log("Documento abierto: " + artifact.display_name)
-        return {"ok": True, "url": "/api/pdf/" + pdf_id, "name": artifact.display_name}
+        return {"ok": True, "id": pdf_id, "url": "/api/pdf/" + pdf_id, "name": artifact.display_name}
 
 
 @app.post("/api/close-pdf")
-def api_close_pdf(request: Request, response: Response) -> dict[str, Any]:
+def api_close_pdf(payload: ClosePdfPayload, request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
     with state.lock:
-        state.clear_pdf()
-        state.append_log("PDF cerrado")
+        target_id = (payload.pdf_id or state.current_pdf_id).strip()
+        state.clear_pdf(target_id)
+        if target_id:
+            state.append_log("PDF cerrado: " + target_id)
+        else:
+            state.append_log("PDF cerrado")
         return {"ok": True}
 
 
@@ -794,7 +2005,7 @@ HTML_PAGE = """
       font-size: 13px;
       color: rgba(15, 23, 42, 0.62);
     }
-    input, button {
+    input, select, button {
       font: inherit;
       border-radius: 14px;
       border: 1px solid rgba(148, 163, 184, 0.26);
@@ -805,13 +2016,13 @@ HTML_PAGE = """
         background 180ms ease,
         border-color 180ms ease;
     }
-    input {
+    input, select {
       background: rgba(255, 255, 255, 0.88);
       color: var(--text);
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
     }
     input::placeholder { color: #8b98b6; }
-    input:focus {
+    input:focus, select:focus {
       outline: none;
       border-color: rgba(45, 107, 255, 0.58);
       box-shadow: 0 0 0 4px rgba(45, 107, 255, 0.16);
@@ -989,12 +2200,13 @@ HTML_PAGE = """
     }
     .grid {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 360px;
+      grid-template-columns: fit-content(760px) 360px;
       grid-template-areas:
         "main hero"
         "results results";
       gap: 16px;
       min-height: 0;
+      justify-content: start;
     }
     .consulta-layout {
       display: grid;
@@ -1010,6 +2222,9 @@ HTML_PAGE = """
     .main-card {
       grid-area: main;
       background: var(--surface-strong);
+      width: fit-content;
+      max-width: 100%;
+      justify-self: start;
     }
     .hero-card {
       grid-area: hero;
@@ -1104,6 +2319,74 @@ HTML_PAGE = """
       gap: 8px;
       flex-wrap: wrap;
       justify-content: flex-end;
+    }
+    .pdf-sidecar-tabs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 10px 12px 0;
+      overflow: auto;
+      max-height: 106px;
+      background: linear-gradient(180deg, rgba(248,251,255,0.78), rgba(244,248,255,0.94));
+      border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    .pdf-tab-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .pdf-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 100%;
+      padding: 8px 10px;
+      border-radius: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--text);
+      cursor: pointer;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
+      font-weight: 700;
+      text-align: left;
+    }
+    .pdf-tab.active {
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+      border-color: transparent;
+    }
+    .pdf-tab-label {
+      display: inline-block;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .pdf-tab-close {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: rgba(255,255,255,0.92);
+      color: #0f172a;
+      cursor: pointer;
+      flex: 0 0 auto;
+      font-size: 18px;
+      line-height: 1;
+      font-weight: 900;
+      box-shadow: 0 6px 14px rgba(15, 23, 42, 0.08);
+    }
+    .pdf-tab-close:hover {
+      background: rgba(248,250,252,1);
+      transform: translateY(-1px);
+    }
+    .pdf-tab.active + .pdf-tab-close {
+      border-color: rgba(255,255,255,0.24);
+      background: rgba(255,255,255,0.14);
+      color: #fff;
     }
     .pdf-sidecar iframe {
       width: 100%;
@@ -1206,6 +2489,14 @@ HTML_PAGE = """
     tbody tr:hover {
       background: rgba(235, 243, 255, 0.92);
     }
+    tbody tr.selectable-row {
+      cursor: pointer;
+    }
+    tbody tr.selected-row {
+      background: rgba(45, 107, 255, 0.12);
+      outline: 2px solid rgba(45, 107, 255, 0.28);
+      outline-offset: -2px;
+    }
     .table-scroll {
       overflow: visible;
       border: 0;
@@ -1271,6 +2562,72 @@ HTML_PAGE = """
       margin-bottom: 8px;
     }
     .empty { color: var(--muted); padding: 12px 0; }
+    .litigante-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      margin: 8px 0 14px;
+    }
+    .litigante-selected-info {
+      flex: 1 1 320px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .cartola-box {
+      margin: 12px 0 18px;
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: linear-gradient(180deg, rgba(248,251,255,0.96), rgba(239,245,255,0.92));
+      box-shadow: 0 16px 30px rgba(15, 23, 42, 0.08);
+    }
+    .cartola-header {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .cartola-header h4 {
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: #384158;
+    }
+    .cartola-meta {
+      font-size: 12px;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    .cartola-controls {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 12px;
+    }
+    .cartola-field {
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #384158;
+    }
+    .cartola-actions {
+      display: flex;
+      justify-content: flex-end;
+      align-items: end;
+      min-height: 100%;
+    }
+    .cartola-status {
+      margin-bottom: 12px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
     .small { font-size: 12px; color: var(--muted); }
     @keyframes fade-in {
       from { opacity: 0; }
@@ -1315,6 +2672,9 @@ HTML_PAGE = """
         padding: 14px;
       }
       .consulta-layout {
+        grid-template-columns: 1fr;
+      }
+      .cartola-controls {
         grid-template-columns: 1fr;
       }
       .pdf-modal {
@@ -1391,6 +2751,7 @@ HTML_PAGE = """
                 <button type="button" class="secondary" id="closePdfSidecarBtn">Cerrar PDF</button>
               </div>
             </div>
+            <div id="pdfSidecarTabs" class="pdf-sidecar-tabs"></div>
             <iframe id="pdfSidecarFrame" title="Visor PDF"></iframe>
           </aside>
         </div>
@@ -1399,7 +2760,8 @@ HTML_PAGE = """
   </div>
 
   <script>
-    var state = { results: {}, logs: [], pdfUrl: "", pdfTitle: "", pdfPanelWidth: 560, loggedIn: false, pendingRows: [], pendingStatus: "", detail: { rit: "", rows: [], status: "", loading: false, error: "" } };
+    var DEFAULT_HEADLESS = __DEFAULT_HEADLESS__;
+    var state = { results: {}, logs: [], pdfTabs: [], activePdfTabId: "", pdfPanelWidth: 560, loggedIn: false, pendingRows: [], pendingStatus: "", selectedLitigante: null, cartola: { open: false, accounts: [], selected_account: "", start_date: "", end_date: "", movements: [] }, detail: { rit: "", rows: [], status: "", loading: false, error: "" } };
     var activeTab = "pendientes";
     var statusPollTimer = null;
     var lastRenderedResultsKey = "";
@@ -1585,14 +2947,124 @@ HTML_PAGE = """
 
     var lastRenderedPdfUrl = "";
 
+    function getActivePdfTab() {
+      for (var i = 0; i < state.pdfTabs.length; i++) {
+        if (state.pdfTabs[i].id === state.activePdfTabId) {
+          return state.pdfTabs[i];
+        }
+      }
+      return state.pdfTabs.length ? state.pdfTabs[state.pdfTabs.length - 1] : null;
+    }
+
+    function getPdfTitleForRow(rowData, sectionNameInner) {
+      var candidates = [
+        rowData && rowData.referencia,
+        rowData && rowData.Referencia,
+        rowData && rowData["Referencia"],
+        rowData && rowData["referencia"],
+        rowData && rowData.text,
+        rowData && rowData.Titulo,
+        rowData && rowData.titulo
+      ];
+      for (var i = 0; i < candidates.length; i++) {
+        var value = candidates[i];
+        if (value !== null && value !== undefined) {
+          var text = String(value).trim();
+          if (text) {
+            return text;
+          }
+        }
+      }
+      return sectionNameInner ? String(sectionNameInner) : "PDF";
+    }
+
+    function rowSignature(rowData) {
+      if (!rowData) {
+        return "";
+      }
+      var keys = Object.keys(rowData).sort();
+      var parts = [];
+      for (var i = 0; i < keys.length; i++) {
+        var key = keys[i];
+        parts.push(key + ":" + String(rowData[key] === null || rowData[key] === undefined ? "" : rowData[key]));
+      }
+      return parts.join("||");
+    }
+
+    function formatLitiganteLabel(rowData) {
+      if (!rowData) {
+        return "";
+      }
+      var parts = [
+        rowData["Sujeto"],
+        rowData["Nombre o Razón Social"],
+        rowData["Rut/Pasaporte"]
+      ];
+      var text = [];
+      for (var i = 0; i < parts.length; i++) {
+        var value = parts[i];
+        if (value !== null && value !== undefined && String(value).trim()) {
+          text.push(String(value).trim());
+        }
+      }
+      return text.join(" | ");
+    }
+
+    function renderPdfTabs(tabsRoot) {
+      if (!tabsRoot) {
+        return;
+      }
+      tabsRoot.innerHTML = "";
+      for (var i = 0; i < state.pdfTabs.length; i++) {
+        (function (tab) {
+          var wrap = document.createElement("div");
+          wrap.className = "pdf-tab-wrap";
+
+          var button = document.createElement("button");
+          button.type = "button";
+          button.className = "pdf-tab" + (tab.id === state.activePdfTabId ? " active" : "");
+          button.title = tab.title || "PDF";
+
+          var label = document.createElement("span");
+          label.className = "pdf-tab-label";
+          label.textContent = tab.title || "PDF";
+
+          var close = document.createElement("button");
+          close.type = "button";
+          close.className = "pdf-tab-close";
+          close.title = "Cerrar pestaña";
+          close.textContent = "×";
+          close.onclick = function (event) {
+            event.stopPropagation();
+            closePdfTab(tab.id);
+          };
+
+          button.appendChild(label);
+          button.onclick = function () {
+            activatePdfTab(tab.id);
+          };
+          wrap.appendChild(button);
+          wrap.appendChild(close);
+          tabsRoot.appendChild(wrap);
+        })(state.pdfTabs[i]);
+      }
+    }
+
+    function activatePdfTab(tabId) {
+      state.activePdfTabId = tabId || "";
+      syncPdfSidecar();
+    }
+
     function syncPdfSidecar() {
       var resultsCard = document.querySelector(".results");
       var resultsShell = document.querySelector(".results-shell");
       var resizer = document.getElementById("pdfResizer");
       var sidecar = document.getElementById("pdfSidecar");
+      var tabsRoot = document.getElementById("pdfSidecarTabs");
       var frame = document.getElementById("pdfSidecarFrame");
       var title = document.getElementById("pdfSidecarTitle");
-      var hasPdf = !!state.pdfUrl;
+      var activeTab = getActivePdfTab();
+      var hasPdf = !!activeTab;
 
       if (resultsCard) {
         resultsCard.classList.toggle("has-pdf", hasPdf);
@@ -1604,6 +3076,8 @@ HTML_PAGE = """
         return;
       }
 
+      renderPdfTabs(tabsRoot);
+
       if (!hasPdf) {
         sidecar.classList.add("hidden");
         if (resizer) {
@@ -1612,6 +3086,9 @@ HTML_PAGE = """
         }
         frame.src = "about:blank";
         lastRenderedPdfUrl = "";
+        state.activePdfTabId = "";
+        state.pdfUrl = "";
+        state.pdfTitle = "";
         return;
       }
 
@@ -1620,12 +3097,14 @@ HTML_PAGE = """
         resizer.classList.remove("hidden");
       }
       if (title) {
-        title.textContent = state.pdfTitle || "PDF";
+        title.textContent = activeTab.title || "PDF";
       }
-      if (state.pdfUrl !== lastRenderedPdfUrl) {
+      state.pdfUrl = activeTab.url || "";
+      state.pdfTitle = activeTab.title || "PDF";
+      if (activeTab.url !== lastRenderedPdfUrl) {
         frame.src = "about:blank";
-        frame.src = state.pdfUrl + "?v=" + new Date().getTime();
-        lastRenderedPdfUrl = state.pdfUrl;
+        frame.src = activeTab.url + "?v=" + new Date().getTime();
+        lastRenderedPdfUrl = activeTab.url;
       }
     }
 
@@ -1683,29 +3162,71 @@ HTML_PAGE = """
       }
     }
 
-    function openPdfSidecar(url, title) {
-      state.pdfUrl = url || "";
-      state.pdfTitle = title || "PDF";
+    function openPdfSidecar(url, title, pdfId) {
+      if (!url) {
+        return;
+      }
+      var tabId = pdfId || ("local-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+      var existing = null;
+      for (var i = 0; i < state.pdfTabs.length; i++) {
+        if (state.pdfTabs[i].id === tabId) {
+          existing = state.pdfTabs[i];
+          break;
+        }
+      }
+      if (existing) {
+        existing.url = url;
+        existing.title = title || existing.title || "PDF";
+      } else {
+        state.pdfTabs.push({
+          id: tabId,
+          url: url,
+          title: title || "PDF"
+        });
+      }
+      state.activePdfTabId = tabId;
       syncPdfSidecar();
     }
 
-    function closePdfSidecar() {
-      xhrRequest("POST", "/api/close-pdf", null, function (status, data) {
-        if (status >= 200 && status < 300) {
-          state.pdfUrl = "";
-          state.pdfTitle = "";
-          syncPdfSidecar();
-          refreshStatus();
-        } else {
+    function closePdfTab(tabId) {
+      var targetId = tabId || state.activePdfTabId;
+      if (!targetId) {
+        return;
+      }
+      xhrRequest("POST", "/api/close-pdf", { pdf_id: targetId }, function (status, data) {
+        if (!(status >= 200 && status < 300)) {
           setProgressState(0, (data && data.detail) || "No se pudo cerrar el PDF");
+          return;
         }
+        var nextTabs = [];
+        var nextActive = "";
+        for (var i = 0; i < state.pdfTabs.length; i++) {
+          if (state.pdfTabs[i].id !== targetId) {
+            nextTabs.push(state.pdfTabs[i]);
+          }
+        }
+        state.pdfTabs = nextTabs;
+        if (state.activePdfTabId === targetId) {
+          nextActive = state.pdfTabs.length ? state.pdfTabs[state.pdfTabs.length - 1].id : "";
+        } else {
+          nextActive = state.activePdfTabId;
+        }
+        state.activePdfTabId = nextActive;
+        syncPdfSidecar();
+        refreshStatus();
       });
+    }
+
+    function closePdfSidecar() {
+      closePdfTab(state.activePdfTabId);
     }
 
     function buildDataTable(rows, sectionName, options) {
       options = options || {};
       var enableRitDrilldown = !!options.enableRitDrilldown;
       var onRitClick = options.onRitClick || null;
+      var onRowSelect = options.onRowSelect || null;
+      var selectedRowSignature = options.selectedRowSignature || "";
       var table = document.createElement("table");
       var headers = [];
       var rowKeys = Object.keys(rows[0]);
@@ -1738,13 +3259,26 @@ HTML_PAGE = """
       for (var r = 0; r < rows.length; r++) {
         (function (rowData, sectionNameInner) {
           var tr = document.createElement("tr");
+          if (sectionNameInner === "litigantes" && typeof onRowSelect === "function") {
+            tr.className = "selectable-row";
+            tr.title = "Seleccionar litigante";
+            tr.style.cursor = "pointer";
+            var currentSignature = rowSignature(rowData);
+            if (selectedRowSignature && currentSignature === selectedRowSignature) {
+              tr.classList.add("selected-row");
+            }
+            tr.onclick = function () {
+              onRowSelect(rowData);
+            };
+          }
           tr.ondblclick = function () {
             if (!rowData.pdf_url) {
               return;
             }
-            xhrRequest("POST", "/api/open-pdf", { pdf_url: rowData.pdf_url, prefix: sectionNameInner }, function (status, data) {
+            var pdfTitle = getPdfTitleForRow(rowData, sectionNameInner);
+            xhrRequest("POST", "/api/open-pdf", { pdf_url: rowData.pdf_url, prefix: sectionNameInner, pdf_title: pdfTitle }, function (status, data) {
               if (status >= 200 && status < 300 && data.ok) {
-                openPdfSidecar(data.url, data.name || "PDF");
+                openPdfSidecar(data.url, data.name || pdfTitle || "PDF", data.id);
                 refreshStatus();
               } else {
                 setProgressState(0, (data && data.detail) || "No se pudo abrir el PDF");
@@ -1762,9 +3296,10 @@ HTML_PAGE = """
                 btn.title = "Abrir PDF";
                 btn.innerHTML = iconSvg("pdf");
                 btn.onclick = function () {
-                  xhrRequest("POST", "/api/open-pdf", { pdf_url: rowData.pdf_url, prefix: sectionNameInner }, function (status, data) {
+                  var pdfTitle = getPdfTitleForRow(rowData, sectionNameInner);
+                  xhrRequest("POST", "/api/open-pdf", { pdf_url: rowData.pdf_url, prefix: sectionNameInner, pdf_title: pdfTitle }, function (status, data) {
                     if (status >= 200 && status < 300 && data.ok) {
-                      openPdfSidecar(data.url, data.name || "PDF");
+                      openPdfSidecar(data.url, data.name || pdfTitle || "PDF", data.id);
                     } else {
                       setProgressState(0, (data && data.detail) || "No se pudo abrir el PDF");
                     }
@@ -1844,6 +3379,157 @@ HTML_PAGE = """
       panel.appendChild(box);
     }
 
+    function submitCartolaConsult() {
+      if (!state.cartola || !state.cartola.open) {
+        return;
+      }
+      var accountEl = document.getElementById("cartolaAccount");
+      var startEl = document.getElementById("cartolaStartDate");
+      var endEl = document.getElementById("cartolaEndDate");
+      var payload = {
+        account: accountEl ? String(accountEl.value || "") : "",
+        start_date: startEl ? String(startEl.value || "") : "",
+        end_date: endEl ? String(endEl.value || "") : ""
+      };
+      setProgressState(40, "Consultando cartola...");
+      xhrRequest("POST", "/api/cartola-consult", payload, function (status, data) {
+        if (!(status >= 200 && status < 300)) {
+          setProgressState(0, (data && data.detail) || "No se pudo consultar la cartola");
+          return;
+        }
+        state.cartola = (data && data.cartola) || state.cartola;
+        setProgressState(100, "Cartola actualizada");
+        renderResults(state.results);
+        refreshStatus();
+      });
+    }
+
+    function exportCartolaXls() {
+      if (!state.cartola || !state.cartola.open) {
+        return;
+      }
+      xhrRequest("POST", "/api/cartola-export-xls", null, function (status, data) {
+        if (!(status >= 200 && status < 300)) {
+          setProgressState(0, (data && data.detail) || "No se pudo exportar la cartola");
+          return;
+        }
+        if (data && data.url) {
+          var downloadLink = document.createElement("a");
+          downloadLink.href = data.url;
+          downloadLink.download = (data && data.name) || "Cartola_BancoEstado.xls";
+          downloadLink.style.display = "none";
+          document.body.appendChild(downloadLink);
+          downloadLink.click();
+          window.setTimeout(function () {
+            if (downloadLink.parentNode) {
+              downloadLink.parentNode.removeChild(downloadLink);
+            }
+          }, 1000);
+        }
+        setProgressState(100, "Cartola exportada");
+        refreshStatus();
+      });
+    }
+
+    function renderCartolaPanel(panel) {
+      if (!state.cartola || !state.cartola.open) {
+        return;
+      }
+
+      var cartola = state.cartola;
+      var box = document.createElement("div");
+      box.className = "cartola-box";
+
+      var header = document.createElement("div");
+      header.className = "cartola-header";
+
+      var title = document.createElement("h4");
+      title.textContent = "Cartola Banco Estado";
+      header.appendChild(title);
+
+      var meta = document.createElement("div");
+      meta.className = "cartola-meta";
+      meta.textContent = cartola.selected_account
+        ? "Cuenta seleccionada: " + String(cartola.selected_account)
+        : "Cartola disponible";
+      header.appendChild(meta);
+      box.appendChild(header);
+
+      var controls = document.createElement("div");
+      controls.className = "cartola-controls";
+
+      var accountField = document.createElement("label");
+      accountField.className = "cartola-field";
+      accountField.textContent = "Nro. Cuenta";
+      var accountSelect = document.createElement("select");
+      accountSelect.id = "cartolaAccount";
+      var accounts = cartola.accounts || [];
+      for (var i = 0; i < accounts.length; i++) {
+        var option = document.createElement("option");
+        option.value = accounts[i].value || "";
+        option.textContent = accounts[i].text || accounts[i].value || "";
+        option.selected = (accounts[i].value || "") === (cartola.selected_account || "");
+        accountSelect.appendChild(option);
+      }
+      accountField.appendChild(accountSelect);
+      controls.appendChild(accountField);
+
+      var startField = document.createElement("label");
+      startField.className = "cartola-field";
+      startField.textContent = "Desde";
+      var startInput = document.createElement("input");
+      startInput.id = "cartolaStartDate";
+      startInput.type = "text";
+      startInput.placeholder = "dd/mm/aaaa";
+      startInput.value = cartola.start_date || "";
+      startField.appendChild(startInput);
+      controls.appendChild(startField);
+
+      var endField = document.createElement("label");
+      endField.className = "cartola-field";
+      endField.textContent = "Hasta";
+      var endInput = document.createElement("input");
+      endInput.id = "cartolaEndDate";
+      endInput.type = "text";
+      endInput.placeholder = "dd/mm/aaaa";
+      endInput.value = cartola.end_date || "";
+      endField.appendChild(endInput);
+      controls.appendChild(endField);
+
+      var actions = document.createElement("div");
+      actions.className = "cartola-actions";
+      var consultButton = document.createElement("button");
+      consultButton.type = "button";
+      consultButton.innerHTML = buttonContent("Consultar cartola", "search");
+      consultButton.onclick = submitCartolaConsult;
+      actions.appendChild(consultButton);
+      var exportButton = document.createElement("button");
+      exportButton.type = "button";
+      exportButton.className = "secondary";
+      exportButton.innerHTML = buttonContent("Descargar XLS", "external");
+      exportButton.onclick = exportCartolaXls;
+      exportButton.disabled = !(cartola.movements && cartola.movements.length);
+      actions.appendChild(exportButton);
+      controls.appendChild(actions);
+      box.appendChild(controls);
+
+      var status = document.createElement("div");
+      status.className = "cartola-status";
+      status.textContent = "Movimientos cargados: " + String((cartola.movements || []).length);
+      box.appendChild(status);
+
+      if (cartola.movements && cartola.movements.length) {
+        box.appendChild(buildDataTable(cartola.movements, "cartola", {}));
+      } else {
+        var empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "Aún no hay movimientos cargados para la cartola.";
+        box.appendChild(empty);
+      }
+
+      panel.appendChild(box);
+    }
+
     function renderLogs(lines) {
       setText("logs", (lines || []).join("\\n"));
     }
@@ -1900,6 +3586,30 @@ HTML_PAGE = """
         title.textContent = sectionTitles[section] + " (" + rows.length + ")";
         panel.appendChild(title);
 
+        if (section === "litigantes") {
+          var litiganteActions = document.createElement("div");
+          litiganteActions.className = "litigante-actions";
+          if (state.selectedLitigante) {
+            var selectedInfo = document.createElement("div");
+            selectedInfo.className = "litigante-selected-info";
+            selectedInfo.textContent = "Seleccionado: " + formatLitiganteLabel(state.selectedLitigante);
+            litiganteActions.appendChild(selectedInfo);
+
+            var cartolaButton = document.createElement("button");
+            cartolaButton.type = "button";
+            cartolaButton.innerHTML = buttonContent("Cartola bco.estado", "external");
+            cartolaButton.onclick = openSelectedLitiganteCartola;
+            litiganteActions.appendChild(cartolaButton);
+          } else {
+            var help = document.createElement("div");
+            help.className = "muted";
+            help.textContent = "Selecciona un sujeto para habilitar Cartola bco.estado.";
+            litiganteActions.appendChild(help);
+          }
+          panel.appendChild(litiganteActions);
+          renderCartolaPanel(panel);
+        }
+
         if (!rows.length) {
           var empty = document.createElement("div");
           empty.className = "empty";
@@ -1911,7 +3621,9 @@ HTML_PAGE = """
 
         var table = buildDataTable(rows, section, {
           enableRitDrilldown: section === "cons_lit" || section === "pendientes",
-          onRitClick: section === "pendientes" ? consultPendingRit : openConsLitHistory
+          onRitClick: section === "pendientes" ? consultPendingRit : openConsLitHistory,
+          onRowSelect: section === "litigantes" ? selectLitigante : null,
+          selectedRowSignature: section === "litigantes" && state.selectedLitigante ? rowSignature(state.selectedLitigante) : ""
         });
         panel.appendChild(table);
 
@@ -1962,8 +3674,46 @@ HTML_PAGE = """
         return;
       }
       document.getElementById("rit").value = rit;
-      activeTab = "historia";
       consult();
+    }
+
+    function selectLitigante(rowData) {
+      if (!rowData) {
+        return;
+      }
+      setProgressState(10, "Marcando litigante seleccionado...");
+      xhrRequest("POST", "/api/select-litigante", { litigante: rowData }, function (status, data) {
+        if (!(status >= 200 && status < 300)) {
+          setProgressState(0, (data && data.detail) || "No se pudo seleccionar el litigante");
+          return;
+        }
+        state.selectedLitigante = (data && data.selected_litigante) || rowData;
+        setProgressState(100, "Litigante seleccionado");
+        renderResults(state.results);
+        refreshStatus();
+      });
+    }
+
+    function openSelectedLitiganteCartola() {
+      if (!state.selectedLitigante) {
+        return;
+      }
+      setProgressState(15, "Abriendo Cartola bco.estado...");
+      xhrRequest("POST", "/api/cartola-bco-estado", null, function (status, data) {
+        if (!(status >= 200 && status < 300)) {
+          setProgressState(0, (data && data.detail) || "No se pudo abrir Cartola bco.estado");
+          return;
+        }
+        if (data && data.selected_litigante) {
+          state.selectedLitigante = data.selected_litigante;
+        }
+        if (data && data.cartola) {
+          state.cartola = data.cartola;
+        }
+        setProgressState(100, "Cartola cargada en la app web");
+        renderResults(state.results);
+        refreshStatus();
+      });
     }
 
     function loadPendingCases() {
@@ -1996,10 +3746,6 @@ HTML_PAGE = """
         state.pendingStatus = data.pending_status || "";
         state.results = data.results || {};
         state.logs = data.logs || [];
-        state.pdfUrl = data.current_pdf_url || "";
-        if (!state.pdfUrl) {
-          state.pdfTitle = "";
-        }
         state.progressValue = Number(data.progress_value || 0);
         state.progressStatus = data.progress_status || "";
         state.detail = {
@@ -2009,6 +3755,8 @@ HTML_PAGE = """
           loading: false,
           error: ""
         };
+        state.selectedLitigante = data.selected_litigante || null;
+        state.cartola = data.cartola || { open: false, accounts: [], selected_account: "", start_date: "", end_date: "", movements: [] };
         state.results = Object.assign({}, state.results || {}, { pendientes: state.pendingRows });
 
         document.getElementById("loginView").style.display = state.loggedIn ? "none" : "grid";
@@ -2033,10 +3781,22 @@ HTML_PAGE = """
           }
           setText("meta", meta);
         } else {
+          state.pdfTabs = [];
+          state.activePdfTabId = "";
+          state.pdfUrl = "";
+          state.pdfTitle = "";
+          state.selectedLitigante = null;
+          state.cartola = { open: false, accounts: [], selected_account: "", start_date: "", end_date: "", movements: [] };
+          syncPdfSidecar();
           setText("loginStatus", "Sin sesion activa. Ingresa tus credenciales para continuar.");
         }
 
-        var resultsKey = buildResultsRenderKey(state.results);
+        var resultsKey = buildResultsRenderKey(state.results)
+          + "|cartola:" + String((state.cartola && state.cartola.open) ? 1 : 0)
+          + ":" + String((state.cartola && state.cartola.selected_account) || "")
+          + ":" + String((state.cartola && state.cartola.start_date) || "")
+          + ":" + String((state.cartola && state.cartola.end_date) || "")
+          + ":" + String(((state.cartola && state.cartola.movements) || []).length);
         var logsKey = buildLogsRenderKey(state.logs);
         var detailKey = buildDetailRenderKey(state.detail);
 
@@ -2063,7 +3823,7 @@ HTML_PAGE = """
       var payload = {
         username: document.getElementById("username").value,
         password: document.getElementById("password").value,
-        headless: true
+        headless: DEFAULT_HEADLESS
       };
       setText("loginStatus", "Iniciando sesion...");
       setProgressState(15, "Iniciando sesion...");
@@ -2076,6 +3836,8 @@ HTML_PAGE = """
         }
         setText("loginStatus", "Sesion iniciada");
         setProgressState(0, "Sesion iniciada");
+        state.pdfTabs = [];
+        state.activePdfTabId = "";
         state.pdfUrl = "";
         state.pdfTitle = "";
         syncPdfSidecar();
@@ -2090,7 +3852,6 @@ HTML_PAGE = """
 
     function consult() {
       var rit = document.getElementById("rit").value;
-      activeTab = "historia";
       setProgressState(5, "Preparando consulta...");
       startStatusPolling();
       xhrRequest("POST", "/api/consult", { rit: rit }, function (status, data) {
@@ -2100,6 +3861,7 @@ HTML_PAGE = """
           return;
         }
         setProgressState(100, "Consulta terminada");
+        activeTab = "historia";
         stopStatusPolling();
         refreshStatus();
       });
@@ -2108,6 +3870,8 @@ HTML_PAGE = """
     function logout() {
       xhrRequest("POST", "/api/logout", null, function () {
         setText("loginStatus", "Sesion cerrada");
+        state.pdfTabs = [];
+        state.activePdfTabId = "";
         state.pdfUrl = "";
         state.pdfTitle = "";
         syncPdfSidecar();
@@ -2138,8 +3902,9 @@ HTML_PAGE = """
       closePdfSidecar();
     };
     document.getElementById("openPdfSidecarTabBtn").onclick = function () {
-      if (state.pdfUrl) {
-        window.open(state.pdfUrl, "_blank", "noopener,noreferrer");
+      var activeTab = getActivePdfTab();
+      if (activeTab && activeTab.url) {
+        window.open(activeTab.url, "_blank", "noopener,noreferrer");
       }
     };
     document.getElementById("pdfResizer").addEventListener("pointerdown", beginPdfResize);
@@ -2147,7 +3912,7 @@ HTML_PAGE = """
     document.addEventListener("pointerup", endPdfResize);
     document.addEventListener("pointercancel", endPdfResize);
     window.addEventListener("resize", function () {
-      if (state.pdfUrl) {
+      if (state.pdfTabs && state.pdfTabs.length) {
         syncPdfSidecar();
       }
     });

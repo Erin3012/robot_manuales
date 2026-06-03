@@ -1,5 +1,6 @@
 import queue
 import threading
+import uuid
 import tkinter as tk
 from datetime import datetime
 import tempfile
@@ -122,15 +123,15 @@ class SitfaApp(tk.Tk):
         self.escritos_tree = None
         self.litigantes_tree = None
         self.cons_lit_tree = None
-        self.pdf_canvas = None
-        self.pdf_scrollbar = None
-        self.pdf_inner_frame = None
+        self.pdf_notebook = None
         self.pdf_status_var = tk.StringVar(value="Sin PDF cargado")
         self.pdf_zoom_var = tk.DoubleVar(value=1.35)
         self.log_text = None
         self._section_rows: dict[str, list[dict]] = {}
-        self._pdf_images: list[ImageTk.PhotoImage] = []
-        self._current_pdf_path: str | None = None
+        self._pdf_tabs: dict[str, dict[str, object]] = {}
+        self._pdf_tab_counters: dict[str, int] = {}
+        self._current_pdf_tab_id: str = ""
+        self._pdf_home_tab_id: str = ""
 
         self._build_login_frame()
         self._build_case_frame()
@@ -232,22 +233,13 @@ class SitfaApp(tk.Tk):
         ttk.Button(zoom_bar, text="+", width=3, command=lambda: self._change_pdf_zoom(0.1)).pack(side="left", padx=(6, 0))
         ttk.Button(zoom_bar, text="Ajustar", command=self._fit_pdf_width).pack(side="left", padx=(10, 0))
         ttk.Button(zoom_bar, text="100%", command=self._reset_pdf_zoom).pack(side="left", padx=(6, 0))
+        ttk.Button(zoom_bar, text="Cerrar pestaña", command=self._close_current_pdf_tab).pack(side="left", padx=(12, 0))
         ttk.Label(zoom_bar, textvariable=self.pdf_zoom_var, foreground="#334155").pack(side="right")
 
-        self.pdf_canvas = tk.Canvas(right_panel, background="#111111", highlightthickness=0)
-        self.pdf_scrollbar = ttk.Scrollbar(right_panel, orient="vertical", command=self.pdf_canvas.yview)
-        self.pdf_canvas.configure(yscrollcommand=self.pdf_scrollbar.set)
-
-        self.pdf_inner_frame = ttk.Frame(self.pdf_canvas)
-        self._pdf_window = self.pdf_canvas.create_window((0, 0), window=self.pdf_inner_frame, anchor="nw")
-
-        self.pdf_inner_frame.bind("<Configure>", self._on_pdf_inner_configure)
-        self.pdf_canvas.bind("<Configure>", self._on_pdf_canvas_configure)
-        self.pdf_canvas.bind("<Enter>", self._bind_pdf_mousewheel)
-        self.pdf_canvas.bind("<Leave>", self._unbind_pdf_mousewheel)
-
-        self.pdf_canvas.grid(row=2, column=0, sticky="nsew")
-        self.pdf_scrollbar.grid(row=2, column=1, sticky="ns")
+        self.pdf_notebook = ttk.Notebook(right_panel)
+        self.pdf_notebook.grid(row=2, column=0, sticky="nsew")
+        self.pdf_notebook.bind("<<NotebookTabChanged>>", self._on_pdf_tab_changed)
+        self._build_pdf_home_tab()
 
         content.add(left_panel, weight=3)
         content.add(right_panel, weight=2)
@@ -313,65 +305,102 @@ class SitfaApp(tk.Tk):
         frame.columnconfigure(0, weight=1)
         return text
 
-    def _on_pdf_inner_configure(self, _event: tk.Event) -> None:
-        if self.pdf_canvas is None:
+    def _build_pdf_home_tab(self) -> None:
+        if self.pdf_notebook is None:
             return
-        self.pdf_canvas.configure(scrollregion=self.pdf_canvas.bbox("all"))
+        frame = ttk.Frame(self.pdf_notebook, padding=16)
+        self.pdf_notebook.add(frame, text="Inicio")
+        ttk.Label(
+            frame,
+            text="Los PDFs abiertos apareceran como nuevas pestañas aqui.\nSelecciona una pestaña y usa 'Cerrar pestaña' para quitarla.",
+            justify="center",
+            padding=24,
+        ).pack(anchor="center", expand=True)
+        self._pdf_home_tab_id = getattr(frame, "_pdf_tab_id", "")
 
-    def _on_pdf_canvas_configure(self, event: tk.Event) -> None:
-        if self.pdf_canvas is None:
-            return
-        if hasattr(self, "_pdf_window"):
-            self.pdf_canvas.itemconfigure(self._pdf_window, width=event.width)
+    def _unique_pdf_tab_title(self, base_title: str) -> str:
+        base_title = base_title.strip() or "PDF"
+        current = self._pdf_tab_counters.get(base_title, 0) + 1
+        self._pdf_tab_counters[base_title] = current
+        return base_title if current == 1 else f"{base_title} ({current})"
 
-    def _bind_pdf_mousewheel(self, _event: tk.Event) -> None:
-        if self.pdf_canvas is None:
-            return
-        self.pdf_canvas.bind_all("<MouseWheel>", self._on_pdf_mousewheel)
-        self.pdf_canvas.bind_all("<Button-4>", self._on_pdf_mousewheel)
-        self.pdf_canvas.bind_all("<Button-5>", self._on_pdf_mousewheel)
+    def _get_selected_pdf_tab_id(self) -> str:
+        if self.pdf_notebook is None:
+            return ""
+        selected = self.pdf_notebook.select()
+        if not selected:
+            return ""
+        try:
+            widget = self.nametowidget(selected)
+        except Exception:
+            return ""
+        return str(getattr(widget, "_pdf_tab_id", ""))
 
-    def _unbind_pdf_mousewheel(self, _event: tk.Event) -> None:
-        if self.pdf_canvas is None:
+    def _on_pdf_tab_changed(self, _event: tk.Event) -> None:
+        tab_id = self._get_selected_pdf_tab_id()
+        if not tab_id:
+            self._current_pdf_tab_id = ""
+            self.pdf_status_var.set("Sin PDF cargado")
+            self.pdf_zoom_var.set(1.35)
             return
-        self.pdf_canvas.unbind_all("<MouseWheel>")
-        self.pdf_canvas.unbind_all("<Button-4>")
-        self.pdf_canvas.unbind_all("<Button-5>")
+        self._current_pdf_tab_id = tab_id
+        state = self._pdf_tabs.get(tab_id, {})
+        title = str(state.get("title", "PDF"))
+        zoom = float(state.get("zoom", 1.35) or 1.35)
+        self.pdf_status_var.set(f"{title}  x{zoom:.2f}")
+        self.pdf_zoom_var.set(round(zoom, 2))
 
-    def _on_pdf_mousewheel(self, event: tk.Event) -> None:
-        if self.pdf_canvas is None:
-            return
+    def _bind_pdf_mousewheel(self, canvas: tk.Canvas, _event: tk.Event) -> None:
+        canvas.bind_all("<MouseWheel>", lambda event: self._on_pdf_mousewheel(canvas, event))
+        canvas.bind_all("<Button-4>", lambda event: self._on_pdf_mousewheel(canvas, event))
+        canvas.bind_all("<Button-5>", lambda event: self._on_pdf_mousewheel(canvas, event))
+
+    def _unbind_pdf_mousewheel(self, canvas: tk.Canvas, _event: tk.Event) -> None:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    def _on_pdf_mousewheel(self, canvas: tk.Canvas, event: tk.Event) -> None:
         delta = getattr(event, "delta", 0)
         if delta:
-            self.pdf_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
         elif getattr(event, "num", None) == 4:
-            self.pdf_canvas.yview_scroll(-1, "units")
+            canvas.yview_scroll(-1, "units")
         elif getattr(event, "num", None) == 5:
-            self.pdf_canvas.yview_scroll(1, "units")
+            canvas.yview_scroll(1, "units")
 
-    def _render_pdf(self, pdf_path: Path, scale: float | None = None) -> None:
-        if self.pdf_inner_frame is None:
+    def _render_pdf_tab(self, tab_id: str, scale: float | None = None) -> None:
+        state = self._pdf_tabs.get(tab_id)
+        if not state:
             return
 
-        pdf_path = pdf_path.resolve()
+        pdf_path = Path(str(state.get("path", ""))).resolve()
+        scroll_frame = state.get("scroll_frame")
+        if not isinstance(scroll_frame, ttk.Frame):
+            return
+
         if not pdf_path.exists():
             self.pdf_status_var.set("El PDF no existe")
             return
 
-        self._clear_pdf_viewer()
-        self._current_pdf_path = str(pdf_path)
+        for child in list(scroll_frame.winfo_children()):
+            child.destroy()
+        state["images"] = []
 
         if scale is None:
-            scale = float(self.pdf_zoom_var.get() or 1.35)
+            scale = float(state.get("zoom", self.pdf_zoom_var.get() or 1.35) or 1.35)
+        scale = max(0.5, min(3.0, scale))
+        state["zoom"] = round(scale, 2)
+        state["title"] = str(state.get("title", pdf_path.name))
         self.pdf_zoom_var.set(round(scale, 2))
-        self.pdf_status_var.set(f"{pdf_path.name}  x{scale:.2f}")
+        self.pdf_status_var.set(f"{state['title']}  x{scale:.2f}")
 
         images: list[ImageTk.PhotoImage] = []
         try:
             document = fitz.open(pdf_path)
         except Exception as exc:
-            ttk.Label(self.pdf_inner_frame, text=f"No se pudo abrir el PDF: {exc}", padding=16).pack(anchor="w")
-            self._pdf_images = images
+            ttk.Label(scroll_frame, text=f"No se pudo abrir el PDF: {exc}", padding=16).pack(anchor="w")
+            state["images"] = images
             return
 
         matrix = fitz.Matrix(scale, scale)
@@ -382,56 +411,99 @@ class SitfaApp(tk.Tk):
             photo = ImageTk.PhotoImage(image)
             images.append(photo)
 
-            page_header = ttk.Label(self.pdf_inner_frame, text=f"Pagina {page_number + 1}", padding=(12, 12, 12, 4))
+            page_header = ttk.Label(scroll_frame, text=f"Pagina {page_number + 1}", padding=(12, 12, 12, 4))
             page_header.pack(anchor="w")
 
-            image_label = ttk.Label(self.pdf_inner_frame, image=photo)
+            image_label = ttk.Label(scroll_frame, image=photo)
             image_label.pack(anchor="w", padx=12, pady=(0, 12))
 
-        self._pdf_images = images
+        state["images"] = images
+        canvas = state.get("canvas")
+        if isinstance(canvas, tk.Canvas):
+            canvas.yview_moveto(0)
+            canvas.configure(scrollregion=canvas.bbox("all"))
         try:
             document.close()
         except Exception:
             pass
 
-    def _change_pdf_zoom(self, delta: float) -> None:
-        if self.pdf_inner_frame is None:
+    def _create_pdf_tab(self, pdf_path: Path, title: str | None = None) -> None:
+        if self.pdf_notebook is None:
             return
-        current = float(self.pdf_zoom_var.get() or 1.35)
+
+        pdf_path = pdf_path.resolve()
+        if not pdf_path.exists():
+            return
+
+        tab_title = self._unique_pdf_tab_title(title or pdf_path.stem)
+        frame = ttk.Frame(self.pdf_notebook)
+        canvas = tk.Canvas(frame, highlightthickness=0, background="#111111")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scroll_frame = ttk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+
+        def _on_frame_configure(_event: object) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        scroll_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind("<Enter>", lambda _event: self._bind_pdf_mousewheel(canvas, _event))
+        canvas.bind("<Leave>", lambda _event: self._unbind_pdf_mousewheel(canvas, _event))
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        tab_id = uuid.uuid4().hex
+        setattr(frame, "_pdf_tab_id", tab_id)
+        self._pdf_tabs[tab_id] = {
+            "frame": frame,
+            "canvas": canvas,
+            "scroll_frame": scroll_frame,
+            "path": str(pdf_path),
+            "title": tab_title,
+            "zoom": float(self.pdf_zoom_var.get() or 1.35),
+            "images": [],
+        }
+
+        self.pdf_notebook.add(frame, text=tab_title)
+        self.pdf_notebook.select(frame)
+        self._current_pdf_tab_id = tab_id
+        self._render_pdf_tab(tab_id, float(self.pdf_zoom_var.get() or 1.35))
+
+    def _change_pdf_zoom(self, delta: float) -> None:
+        tab_id = self._get_selected_pdf_tab_id()
+        if not tab_id:
+            return
+        state = self._pdf_tabs.get(tab_id)
+        if not state:
+            return
+        current = float(state.get("zoom", 1.35) or 1.35)
         new_scale = max(0.5, min(3.0, current + delta))
-        pdf_name = self.pdf_status_var.get().split("  x", 1)[0].strip()
-        current_path = getattr(self, "_current_pdf_path", None)
-        if current_path:
-            self._render_pdf(Path(current_path), new_scale)
-        else:
-            self.pdf_zoom_var.set(round(new_scale, 2))
-            self.pdf_status_var.set(f"{pdf_name}  x{new_scale:.2f}" if pdf_name and pdf_name != "Sin PDF cargado" else f"x{new_scale:.2f}")
+        self._render_pdf_tab(tab_id, new_scale)
 
     def _reset_pdf_zoom(self) -> None:
-        current_path = getattr(self, "_current_pdf_path", None)
-        if current_path:
-            self._render_pdf(Path(current_path), 1.35)
+        tab_id = self._get_selected_pdf_tab_id()
+        if not tab_id:
+            return
+        if tab_id in self._pdf_tabs:
+            self._render_pdf_tab(tab_id, 1.35)
 
     def _fit_pdf_width(self) -> None:
-        current_path = getattr(self, "_current_pdf_path", None)
-        if current_path is None or self.pdf_canvas is None:
+        tab_id = self._get_selected_pdf_tab_id()
+        state = self._pdf_tabs.get(tab_id)
+        if not state:
             return
-        width = max(400, self.pdf_canvas.winfo_width() - 40)
+        canvas = state.get("canvas")
+        if not isinstance(canvas, tk.Canvas):
+            return
+        width = max(400, canvas.winfo_width() - 40)
         scale = max(0.5, min(3.0, width / 900.0))
-        self._render_pdf(Path(current_path), scale)
-
-    def _clear_pdf_viewer(self) -> None:
-        if self.pdf_inner_frame is None:
-            return
-        current_path = getattr(self, "_current_pdf_path", None)
-        for child in list(self.pdf_inner_frame.winfo_children()):
-            child.destroy()
-        self._pdf_images = []
-        self.pdf_status_var.set("Sin PDF cargado")
-        self._current_pdf_path = None
-        if self.pdf_canvas is not None:
-            self.pdf_canvas.yview_moveto(0)
-        self._delete_pdf_file(current_path)
+        self._render_pdf_tab(tab_id, scale)
 
     def _delete_pdf_file(self, path_value: str | None) -> None:
         if not path_value:
@@ -445,12 +517,44 @@ class SitfaApp(tk.Tk):
         except OSError:
             pass
 
+    def _close_pdf_tab(self, tab_id: str) -> None:
+        if tab_id == self._pdf_home_tab_id or tab_id not in self._pdf_tabs:
+            return
+        state = self._pdf_tabs.pop(tab_id)
+        frame = state.get("frame")
+        if isinstance(frame, ttk.Frame) and self.pdf_notebook is not None:
+            try:
+                self.pdf_notebook.forget(frame)
+            except Exception:
+                pass
+        self._delete_pdf_file(str(state.get("path", "")))
+        if self._current_pdf_tab_id == tab_id:
+            self._current_pdf_tab_id = ""
+        if self.pdf_notebook is not None and self.pdf_notebook.tabs():
+            self.pdf_notebook.select(self.pdf_notebook.tabs()[-1])
+
+    def _close_current_pdf_tab(self) -> None:
+        self._close_pdf_tab(self._get_selected_pdf_tab_id())
+
+    def _close_all_pdf_tabs(self) -> None:
+        for tab_id in list(self._pdf_tabs.keys()):
+            self._close_pdf_tab(tab_id)
+        if self.pdf_notebook is not None and self._pdf_home_tab_id:
+            try:
+                home_widget = self.nametowidget(self._pdf_home_tab_id) if self._pdf_home_tab_id else None
+            except Exception:
+                home_widget = None
+            if home_widget is not None:
+                try:
+                    self.pdf_notebook.select(home_widget)
+                except Exception:
+                    pass
+        self.pdf_status_var.set("Sin PDF cargado")
+        self.pdf_zoom_var.set(1.35)
+        self._current_pdf_tab_id = ""
+
     def _display_pdf(self, pdf_path: Path) -> None:
-        previous_path = getattr(self, "_current_pdf_path", None)
-        resolved_pdf = str(pdf_path.resolve())
-        if previous_path and previous_path != resolved_pdf:
-            self._delete_pdf_file(previous_path)
-        self._render_pdf(pdf_path, float(self.pdf_zoom_var.get() or 1.35))
+        self._create_pdf_tab(pdf_path, pdf_path.stem)
 
     def _set_busy(self, busy: bool, message: str) -> None:
         self._busy = busy
@@ -488,7 +592,6 @@ class SitfaApp(tk.Tk):
             messagebox.showerror("Consulta", "Debe ingresar un RIT.")
             return
         self._clear_result_trees()
-        self._clear_pdf_viewer()
         self._set_busy(True, f"Consultando causa {rit}...")
         self._append_log(f"Solicitud de consulta enviada para {rit}.")
         self._worker.submit("consult", {"rit": rit})
@@ -499,7 +602,6 @@ class SitfaApp(tk.Tk):
         self.rit_var.set("")
         self.case_var.set("Sin causa consultada")
         self._clear_result_trees()
-        self._clear_pdf_viewer()
         self.status_var.set("Ingrese un nuevo RIT para consultar otra causa.")
         self.rit_entry.focus_set()
 
@@ -514,7 +616,6 @@ class SitfaApp(tk.Tk):
             for item in tree.get_children():
                 tree.delete(item)
         self._section_rows.clear()
-        self._clear_pdf_viewer()
 
     def _fill_tree(self, tree: ttk.Treeview, rows: list[dict], keys: tuple[str, ...], section: str) -> None:
         for item in tree.get_children():
@@ -674,7 +775,7 @@ class SitfaApp(tk.Tk):
         if self._busy:
             if not messagebox.askyesno("Salir", "Hay una operacion en curso. Desea cerrar igualmente?"):
                 return
-        self._clear_pdf_viewer()
+        self._close_all_pdf_tabs()
         self._worker.submit("shutdown")
 
 
