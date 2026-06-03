@@ -2200,13 +2200,13 @@ HTML_PAGE = """
     }
     .grid {
       display: grid;
-      grid-template-columns: fit-content(760px) 360px;
+      grid-template-columns: minmax(0, 1fr) 360px;
       grid-template-areas:
         "main hero"
         "results results";
       gap: 16px;
       min-height: 0;
-      justify-content: start;
+      width: 100%;
     }
     .consulta-layout {
       display: grid;
@@ -2222,9 +2222,7 @@ HTML_PAGE = """
     .main-card {
       grid-area: main;
       background: var(--surface-strong);
-      width: fit-content;
-      max-width: 100%;
-      justify-self: start;
+      width: 100%;
     }
     .hero-card {
       grid-area: hero;
@@ -2235,6 +2233,7 @@ HTML_PAGE = """
       display: grid;
       gap: 16px;
       min-height: 0;
+      width: 100%;
     }
     .results-shell {
       display: grid;
@@ -2244,6 +2243,7 @@ HTML_PAGE = """
       min-width: 0;
       min-height: 0;
       align-items: start;
+      width: 100%;
     }
     .results.has-pdf .results-shell {
       grid-template-columns: minmax(0, 1fr) 12px var(--pdf-sidecar-width);
