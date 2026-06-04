@@ -1,4 +1,4 @@
-selenium==4.44.0
+playwright
 Pillow
 PyMuPDF
 fastapi

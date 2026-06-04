@@ -12,3 +12,7 @@
 ## Maintenance rule
 - Update these files when a new entry point, dependency, or major flow is added.
 - Keep them short enough that a new chat can read them quickly.
+
+## Automation backend decision
+- The project uses Playwright through `browser_compat.py` as the browser automation base.
+- Chrome is the default channel; Edge remains available as an explicit fallback when needed.

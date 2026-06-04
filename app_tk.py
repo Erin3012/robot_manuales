@@ -9,7 +9,7 @@ from tkinter import messagebox, ttk
 
 import fitz
 from PIL import Image, ImageTk
-from selenium.common.exceptions import WebDriverException
+from browser_compat import WebDriverException
 
 from main import LOGIN_URL, consult_case, create_driver, download_pdf_with_session, login_to_sitfa
 

@@ -19,6 +19,6 @@ if __name__ == "__main__":
         default_headless = True
 
     os.environ["SITFA_WEB_HEADLESS"] = "1" if default_headless else "0"
-    os.environ.setdefault("SITFA_WEB_BROWSER", "edge")
+    os.environ.setdefault("SITFA_WEB_BROWSER", "chrome")
     uvicorn.run("web_app:app", host="127.0.0.1", port=8050, reload=False)
 

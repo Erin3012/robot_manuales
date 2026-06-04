@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -10,6 +11,8 @@ import time
 import tempfile
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +24,7 @@ from xml.sax.saxutils import escape as xml_escape
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
-from selenium.common.exceptions import WebDriverException
+from browser_compat import WebDriverException
 
 from main import (
     LOGIN_URL,
@@ -53,6 +56,7 @@ SESSION_COOKIE_NAME = "sitfa_session_id"
 
 SESSION_STORE: dict[str, "WebState"] = {}
 SESSION_STORE_LOCK = threading.Lock()
+PLAYWRIGHT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sitfa-playwright")
 
 
 class LoginPayload(BaseModel):
@@ -1309,7 +1313,9 @@ def ensure_driver(state: WebState, headless: bool) -> None:
             pass
         state.driver = None
 
-    browser = os.getenv("SITFA_WEB_BROWSER", os.getenv("SITFA_BROWSER", "edge")).strip().lower() or "edge"
+    browser = os.getenv("SITFA_WEB_BROWSER", os.getenv("SITFA_BROWSER", "chrome")).strip().lower() or "chrome"
+    if browser not in {"chrome", "edge"}:
+        browser = "chrome"
     state.append_log(f"Creando driver con {browser.upper()} " + ("headless" if headless else "visible"))
     state.driver = create_driver(initial_url=LOGIN_URL, browser=browser, headless=headless)
     state.headless = headless
@@ -1333,6 +1339,16 @@ def get_session_id(request: Request, response: Response) -> str:
 def get_session_state(request: Request, response: Response) -> WebState:
     session_id = get_session_id(request, response)
     return get_or_create_state(session_id)
+
+
+def run_browser_job(func, *args, **kwargs):
+    future = PLAYWRIGHT_EXECUTOR.submit(func, *args, **kwargs)
+    return future.result()
+
+
+async def run_browser_job_async(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(PLAYWRIGHT_EXECUTOR, partial(func, *args, **kwargs))
 
 
 def require_session(state: WebState) -> Any:
@@ -1416,89 +1432,99 @@ def status(request: Request, response: Response) -> dict[str, Any]:
 
 
 @app.post("/api/login")
-def api_login(payload: LoginPayload, request: Request, response: Response) -> dict[str, Any]:
+async def api_login(payload: LoginPayload, request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
-    with state.lock:
-        try:
-            ensure_driver(state, payload.headless)
-            state.append_log("Solicitud de login enviada")
-            login_to_sitfa(state.driver, payload.username, payload.password, log_callback=state.append_log)
-            state.username = payload.username
-            state.current_rit = ""
-            state.results = {}
+
+    def job() -> dict[str, Any]:
+        with state.lock:
+            try:
+                ensure_driver(state, payload.headless)
+                state.append_log("Solicitud de login enviada")
+                login_to_sitfa(state.driver, payload.username, payload.password, log_callback=state.append_log)
+                state.username = payload.username
+                state.current_rit = ""
+                state.results = {}
+                state.detail_rit = ""
+                state.detail_rows = []
+                state.detail_status = ""
+                state.selected_litigante = None
+                state.reset_cartola()
+                state.authenticated = True
+                state.pending_rows = []
+                state.pending_status = "Pendientes sin cargar"
+                state.status = "Sesion iniciada"
+                state.progress_value = 0.0
+                state.progress_status = ""
+                return {
+                    "ok": True,
+                    "username": state.username,
+                    "headless": state.headless,
+                    "pending_rows": state.pending_rows,
+                    "pending_status": state.pending_status,
+                }
+            except Exception as exc:
+                close_state(state.session_id)
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return await run_browser_job_async(job)
+
+
+@app.get("/api/pending-cases")
+async def api_pending_cases(request: Request, response: Response) -> dict[str, Any]:
+    state = get_session_state(request, response)
+    def job() -> dict[str, Any]:
+        with state.lock:
+            try:
+                rows = refresh_pending_cases(state)
+                state.status = state.pending_status or "Pendientes actualizados"
+                return {"ok": True, "rows": rows, "status": state.pending_status}
+            except Exception as exc:
+                state.pending_rows = []
+                state.pending_status = "No se pudieron cargar causas pendientes"
+                state.append_log("Pendientes: " + str(exc))
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return await run_browser_job_async(job)
+
+
+@app.post("/api/consult")
+async def api_consult(payload: ConsultPayload, request: Request, response: Response) -> dict[str, Any]:
+    state = get_session_state(request, response)
+    def job() -> dict[str, Any]:
+        with state.lock:
+            driver = require_session(state)
+            close_existing_cartola_window(state, driver, log_callback=state.append_log)
+            state.append_log("Consulta enviada para " + payload.rit)
+            state.progress_value = 0.0
+            state.progress_status = "Iniciando consulta"
+            results = consult_case(
+                driver,
+                payload.rit,
+                log_callback=state.append_log,
+                section_callback=lambda section, rows: state.results.__setitem__(section, rows),
+                progress_callback=lambda message, percent: (
+                    setattr(state, "progress_status", message),
+                    setattr(state, "progress_value", percent),
+                    setattr(state, "status", message),
+                ),
+            )
+            state.results = results
+            state.current_rit = payload.rit
+            state.status = "Consulta terminada para " + payload.rit
+            state.progress_status = "Consulta terminada"
+            state.progress_value = 100.0
             state.detail_rit = ""
             state.detail_rows = []
             state.detail_status = ""
             state.selected_litigante = None
             state.reset_cartola()
-            state.authenticated = True
-            state.pending_rows = []
-            state.pending_status = "Pendientes sin cargar"
-            state.status = "Sesion iniciada"
-            state.progress_value = 0.0
-            state.progress_status = ""
-            return {
-                "ok": True,
-                "username": state.username,
-                "headless": state.headless,
-                "pending_rows": state.pending_rows,
-                "pending_status": state.pending_status,
-            }
-        except Exception as exc:
-            close_state(state.session_id)
-            raise HTTPException(status_code=400, detail=str(exc))
+            return {"ok": True, "rit": payload.rit, "results": results}
 
-
-@app.get("/api/pending-cases")
-def api_pending_cases(request: Request, response: Response) -> dict[str, Any]:
-    state = get_session_state(request, response)
-    with state.lock:
-        try:
-            rows = refresh_pending_cases(state)
-            state.status = state.pending_status or "Pendientes actualizados"
-            return {"ok": True, "rows": rows, "status": state.pending_status}
-        except Exception as exc:
-            state.pending_rows = []
-            state.pending_status = "No se pudieron cargar causas pendientes"
-            state.append_log("Pendientes: " + str(exc))
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/api/consult")
-def api_consult(payload: ConsultPayload, request: Request, response: Response) -> dict[str, Any]:
-    state = get_session_state(request, response)
-    with state.lock:
-        driver = require_session(state)
-        close_existing_cartola_window(state, driver, log_callback=state.append_log)
-        state.append_log("Consulta enviada para " + payload.rit)
-        state.progress_value = 0.0
-        state.progress_status = "Iniciando consulta"
-        results = consult_case(
-            driver,
-            payload.rit,
-            log_callback=state.append_log,
-            section_callback=lambda section, rows: state.results.__setitem__(section, rows),
-            progress_callback=lambda message, percent: (
-                setattr(state, "progress_status", message),
-                setattr(state, "progress_value", percent),
-                setattr(state, "status", message),
-            ),
-        )
-        state.results = results
-        state.current_rit = payload.rit
-        state.status = "Consulta terminada para " + payload.rit
-        state.progress_status = "Consulta terminada"
-        state.progress_value = 100.0
-        state.detail_rit = ""
-        state.detail_rows = []
-        state.detail_status = ""
-        state.selected_litigante = None
-        state.reset_cartola()
-        return {"ok": True, "rit": payload.rit, "results": results}
+    return await run_browser_job_async(job)
 
 
 @app.post("/api/select-litigante")
-def api_select_litigante(payload: SelectLitigantePayload, request: Request, response: Response) -> dict[str, Any]:
+async def api_select_litigante(payload: SelectLitigantePayload, request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
     with state.lock:
         driver = require_session(state)
@@ -1506,224 +1532,251 @@ def api_select_litigante(payload: SelectLitigantePayload, request: Request, resp
         close_existing_cartola_window(state, driver, log_callback=state.append_log)
         state.selected_litigante = litigante
         label = str(litigante.get("Sujeto") or litigante.get("Nombre o Razón Social") or litigante.get("Rut/Pasaporte") or "").strip()
+        state.append_log(
+            "Litigante debug: selected="
+            + json.dumps(
+                {
+                    "keys": sorted(list(litigante.keys())),
+                    "signature": str(litigante)[:500],
+                },
+                ensure_ascii=False,
+            )
+        )
         state.append_log("Litigante seleccionado: " + (label or "sin dato"))
         return {"ok": True, "selected_litigante": litigante}
 
 
 @app.post("/api/cartola-bco-estado")
-def api_cartola_bco_estado(request: Request, response: Response) -> dict[str, Any]:
+async def api_cartola_bco_estado(request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
-    with state.lock:
-        driver = require_session(state)
-        close_existing_cartola_window(state, driver, log_callback=state.append_log)
-        if not state.selected_litigante:
-            raise HTTPException(status_code=400, detail="Primero selecciona un litigante en la pestaña Litigantes")
+    def job() -> dict[str, Any]:
+        with state.lock:
+            driver = require_session(state)
+            close_existing_cartola_window(state, driver, log_callback=state.append_log)
+            if not state.selected_litigante:
+                raise HTTPException(status_code=400, detail="Primero selecciona un litigante en la pestaña Litigantes")
 
-        try:
-            selected_label = str(
-                state.selected_litigante.get("Sujeto")
-                or state.selected_litigante.get("Nombre o Razón Social")
-                or state.selected_litigante.get("Rut/Pasaporte")
-                or ""
-            ).strip()
-            state.append_log("Cartola: solicitud recibida para " + (selected_label or "sin dato"))
-            state.status = "Buscando litigantes..."
-            state.progress_status = "Resolviendo ventana Litigantes"
-            state.progress_value = 25.0
-
-            popup_url = resolve_litigantes_popup_url(driver, log_callback=state.append_log)
-            if not popup_url:
-                raise HTTPException(status_code=400, detail="No se pudo resolver la ventana de Litigantes")
-            state.append_log("Cartola: popup de Litigantes resuelto -> " + popup_url)
-            state.status = "Seleccionando litigante..."
-            state.progress_status = "Seleccionando litigante"
-            state.progress_value = 50.0
-
-            popup_url, reason = open_cartola_bco_estado_popup_from_litigantes(
-                driver,
-                selected_litigante=state.selected_litigante,
-                litigantes_popup_url=popup_url,
-                log_callback=state.append_log,
-            )
-        except Exception as exc:
-            state.append_log("Cartola: " + str(exc))
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        if not popup_url:
-            detail = "No se pudo abrir Cartola bco.estado"
-            if reason:
-                detail += " (" + reason + ")"
-            raise HTTPException(status_code=400, detail=detail)
-
-        popup_url = urljoin(driver.current_url, popup_url)
-        popup_url = _resolve_cartola_popup_url(driver, popup_url, log_callback=state.append_log)
-        state.append_log("Cartola: URL capturada -> " + popup_url)
-        state.status = "Abriendo Cartola bco.estado..."
-        state.progress_status = "Abriendo Cartola bco.estado"
-        state.progress_value = 75.0
-
-        try:
-            original_handle = driver.current_window_handle
-            before_handles = set(driver.window_handles)
-            state.append_log(
-                "Cartola: handles antes de abrir="
-                + str(len(before_handles))
-                + " url_actual="
-                + str(getattr(driver, "current_url", ""))
-            )
-            driver.execute_script("window.open(arguments[0], '_blank');", popup_url)
-            opened_handle = ""
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                current_handles = set(driver.window_handles)
-                new_handles = list(current_handles - before_handles)
-                if new_handles:
-                    opened_handle = new_handles[0]
-                    break
-                time.sleep(0.1)
             try:
-                state.append_log("Cartola: handles despues de abrir=" + str(len(driver.window_handles)))
-            except WebDriverException:
-                pass
-            if opened_handle:
-                try:
-                    driver.switch_to.window(opened_handle)
-                    state.cartola_window_handle = opened_handle
-                    state.cartola_popup_url = popup_url
-                    state.append_log("Cartola: ventana enfocada " + opened_handle)
-                    state.append_log("Cartola: url enfocada -> " + str(getattr(driver, "current_url", "")))
-                except WebDriverException as exc:
-                    state.append_log("Cartola: no se pudo enfocar la ventana nueva: " + str(exc))
-            else:
-                state.append_log("Cartola: no apareció una ventana nueva, se navega en la pestaña actual")
-                try:
-                    driver.get(popup_url)
-                    state.cartola_window_handle = driver.current_window_handle
-                    state.cartola_popup_url = popup_url
-                    state.append_log("Cartola: navegación directa realizada -> " + str(getattr(driver, "current_url", "")))
-                except WebDriverException as exc:
-                    raise HTTPException(status_code=400, detail="No se pudo cargar la Cartola bco.estado en la pestaña actual: " + str(exc)) from exc
-
-            wait_for_ready(driver, timeout=8)
-            try:
-                frame_count = len(driver.find_elements("tag name", "frame")) + len(driver.find_elements("tag name", "iframe"))
-                state.append_log("Cartola: frames visibles=" + str(frame_count))
-            except WebDriverException:
-                pass
-            if is_cartola_debug_enabled():
-                snapshot = collect_cartola_debug_snapshot(driver)
+                selected_label = str(
+                    state.selected_litigante.get("Sujeto")
+                    or state.selected_litigante.get("Nombre o Razón Social")
+                    or state.selected_litigante.get("Rut/Pasaporte")
+                    or ""
+                ).strip()
                 state.append_log(
-                    "Cartola: snapshot "
-                    + f"title={snapshot.get('title', '')!r} "
-                    + f"ready={snapshot.get('ready_state', '')} "
-                    + f"html_len={snapshot.get('html_len', 0)}"
+                    "Cartola debug: selected_litigante="
+                    + json.dumps(
+                        {
+                            "keys": sorted(list(state.selected_litigante.keys())),
+                            "selected_label": selected_label,
+                            "signature": str(state.selected_litigante)[:700],
+                        },
+                        ensure_ascii=False,
+                    )
                 )
-            state.cartola_data = read_cartola_payload(driver)
-            state.append_log(
-                "Cartola: panel cargado "
-                + f"cuentas={len(state.cartola_data.get('accounts') or [])} "
-                + f"movimientos={len(state.cartola_data.get('movements') or [])}"
-            )
+                state.append_log("Cartola: solicitud recibida para " + (selected_label or "sin dato"))
+                state.status = "Buscando litigantes..."
+                state.progress_status = "Resolviendo ventana Litigantes"
+                state.progress_value = 25.0
+
+                popup_url = resolve_litigantes_popup_url(driver, log_callback=state.append_log)
+                if not popup_url:
+                    raise HTTPException(status_code=400, detail="No se pudo resolver la ventana de Litigantes")
+                state.append_log("Cartola: popup de Litigantes resuelto -> " + popup_url)
+                state.status = "Seleccionando litigante..."
+                state.progress_status = "Seleccionando litigante"
+                state.progress_value = 50.0
+
+                popup_url, reason = open_cartola_bco_estado_popup_from_litigantes(
+                    driver,
+                    selected_litigante=state.selected_litigante,
+                    litigantes_popup_url=popup_url,
+                    log_callback=state.append_log,
+                )
+            except Exception as exc:
+                state.append_log("Cartola: " + str(exc))
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+            if not popup_url:
+                detail = "No se pudo abrir Cartola bco.estado"
+                if reason:
+                    detail += " (" + reason + ")"
+                raise HTTPException(status_code=400, detail=detail)
+
+            popup_url = urljoin(driver.current_url, popup_url)
+            popup_url = _resolve_cartola_popup_url(driver, popup_url, log_callback=state.append_log)
+            state.append_log("Cartola: URL capturada -> " + popup_url)
+            state.status = "Abriendo Cartola bco.estado..."
+            state.progress_status = "Abriendo Cartola bco.estado"
+            state.progress_value = 75.0
+
             try:
-                driver.switch_to.window(original_handle)
-                driver.switch_to.default_content()
-            except WebDriverException:
-                pass
-            state.append_log("Cartola: datos trasladados a la app web")
-        except WebDriverException as exc:
-            detail = "No se pudo abrir la ventana de Cartola bco.estado: " + str(exc)
-            if is_cartola_debug_enabled():
-                dump_dir = write_cartola_debug_dump(
-                    driver,
-                    context={
-                        "stage": "endpoint_webdriver_exception",
-                        "popup_url": popup_url,
-                        "selected_litigante": state.selected_litigante,
-                        "error": str(exc),
-                    },
+                original_handle = driver.current_window_handle
+                before_handles = set(driver.window_handles)
+                state.append_log(
+                    "Cartola: handles antes de abrir="
+                    + str(len(before_handles))
+                    + " url_actual="
+                    + str(getattr(driver, "current_url", ""))
                 )
-                state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
-                detail += f" | dump={dump_dir}"
-            raise HTTPException(status_code=400, detail=detail) from exc
-        except Exception as exc:
-            detail = str(exc)
-            if is_cartola_debug_enabled():
-                dump_dir = write_cartola_debug_dump(
-                    driver,
-                    context={
-                        "stage": "endpoint_exception",
-                        "popup_url": popup_url,
-                        "selected_litigante": state.selected_litigante,
-                        "error": str(exc),
-                    },
-                )
-                state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
-                detail += f" | dump={dump_dir}"
-            raise HTTPException(status_code=400, detail=detail) from exc
-
-        state.status = "Cartola bco.estado abierta"
-        state.progress_status = "Cartola abierta"
-        state.progress_value = 100.0
-        return {
-            "ok": True,
-            "url": popup_url,
-            "selected_litigante": state.selected_litigante,
-            "cartola": state.cartola_data or empty_cartola_data(),
-        }
-
-
-@app.post("/api/cartola-consult")
-def api_cartola_consult(payload: CartolaConsultPayload, request: Request, response: Response) -> dict[str, Any]:
-    state = get_session_state(request, response)
-    with state.lock:
-        driver = require_session(state)
-        previous_handle = ""
-        try:
-            previous_handle = switch_to_cartola_window(state, driver)
-            state.status = "Consultando cartola..."
-            state.progress_status = "Consultando cartola"
-            state.progress_value = 80.0
-            state.cartola_data = apply_cartola_filters_and_consult(
-                driver,
-                account=payload.account.strip(),
-                start_date=payload.start_date.strip(),
-                end_date=payload.end_date.strip(),
-                log_callback=state.append_log,
-            )
-            state.append_log(
-                "Cartola: consulta actualizada "
-                + f"movimientos={len(state.cartola_data.get('movements') or [])}"
-            )
-        except Exception as exc:
-            detail = str(exc)
-            if is_cartola_debug_enabled():
-                dump_dir = write_cartola_debug_dump(
-                    driver,
-                    context={
-                        "stage": "cartola_consult",
-                        "payload": payload.model_dump(),
-                        "error": str(exc),
-                    },
-                )
-                state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
-                detail += f" | dump={dump_dir}"
-            raise HTTPException(status_code=400, detail=detail) from exc
-        finally:
-            if previous_handle:
+                driver.execute_script("window.open(arguments[0], '_blank');", popup_url)
+                opened_handle = ""
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    current_handles = set(driver.window_handles)
+                    new_handles = list(current_handles - before_handles)
+                    if new_handles:
+                        opened_handle = new_handles[0]
+                        break
+                    time.sleep(0.1)
                 try:
-                    driver.switch_to.window(previous_handle)
+                    state.append_log("Cartola: handles despues de abrir=" + str(len(driver.window_handles)))
+                except WebDriverException:
+                    pass
+                if opened_handle:
+                    try:
+                        driver.switch_to.window(opened_handle)
+                        state.cartola_window_handle = opened_handle
+                        state.cartola_popup_url = popup_url
+                        state.append_log("Cartola: ventana enfocada " + opened_handle)
+                        state.append_log("Cartola: url enfocada -> " + str(getattr(driver, "current_url", "")))
+                    except WebDriverException as exc:
+                        state.append_log("Cartola: no se pudo enfocar la ventana nueva: " + str(exc))
+                else:
+                    state.append_log("Cartola: no apareció una ventana nueva, se navega en la pestaña actual")
+                    try:
+                        driver.get(popup_url)
+                        state.cartola_window_handle = driver.current_window_handle
+                        state.cartola_popup_url = popup_url
+                        state.append_log("Cartola: navegación directa realizada -> " + str(getattr(driver, "current_url", "")))
+                    except WebDriverException as exc:
+                        raise HTTPException(status_code=400, detail="No se pudo cargar la Cartola bco.estado en la pestaña actual: " + str(exc)) from exc
+
+                wait_for_ready(driver, timeout=8)
+                try:
+                    frame_count = len(driver.find_elements("tag name", "frame")) + len(driver.find_elements("tag name", "iframe"))
+                    state.append_log("Cartola: frames visibles=" + str(frame_count))
+                except WebDriverException:
+                    pass
+                if is_cartola_debug_enabled():
+                    snapshot = collect_cartola_debug_snapshot(driver)
+                    state.append_log(
+                        "Cartola: snapshot "
+                        + f"title={snapshot.get('title', '')!r} "
+                        + f"ready={snapshot.get('ready_state', '')} "
+                        + f"html_len={snapshot.get('html_len', 0)}"
+                    )
+                state.cartola_data = read_cartola_payload(driver)
+                state.append_log(
+                    "Cartola: panel cargado "
+                    + f"cuentas={len(state.cartola_data.get('accounts') or [])} "
+                    + f"movimientos={len(state.cartola_data.get('movements') or [])}"
+                )
+                try:
+                    driver.switch_to.window(original_handle)
                     driver.switch_to.default_content()
                 except WebDriverException:
                     pass
+                state.append_log("Cartola: datos trasladados a la app web")
+            except WebDriverException as exc:
+                detail = "No se pudo abrir la ventana de Cartola bco.estado: " + str(exc)
+                if is_cartola_debug_enabled():
+                    dump_dir = write_cartola_debug_dump(
+                        driver,
+                        context={
+                            "stage": "endpoint_webdriver_exception",
+                            "popup_url": popup_url,
+                            "selected_litigante": state.selected_litigante,
+                            "error": str(exc),
+                        },
+                    )
+                    state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
+                    detail += f" | dump={dump_dir}"
+                raise HTTPException(status_code=400, detail=detail) from exc
+            except Exception as exc:
+                detail = str(exc)
+                if is_cartola_debug_enabled():
+                    dump_dir = write_cartola_debug_dump(
+                        driver,
+                        context={
+                            "stage": "endpoint_exception",
+                            "popup_url": popup_url,
+                            "selected_litigante": state.selected_litigante,
+                            "error": str(exc),
+                        },
+                    )
+                    state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
+                    detail += f" | dump={dump_dir}"
+                raise HTTPException(status_code=400, detail=detail) from exc
 
-        state.status = "Cartola actualizada"
-        state.progress_status = "Cartola actualizada"
-        state.progress_value = 100.0
-        return {"ok": True, "cartola": state.cartola_data}
+            state.status = "Cartola bco.estado abierta"
+            state.progress_status = "Cartola abierta"
+            state.progress_value = 100.0
+            return {
+                "ok": True,
+                "url": popup_url,
+                "selected_litigante": state.selected_litigante,
+                "cartola": state.cartola_data or empty_cartola_data(),
+            }
+
+    return await run_browser_job_async(job)
+
+
+@app.post("/api/cartola-consult")
+async def api_cartola_consult(payload: CartolaConsultPayload, request: Request, response: Response) -> dict[str, Any]:
+    state = get_session_state(request, response)
+    def job() -> dict[str, Any]:
+        with state.lock:
+            driver = require_session(state)
+            previous_handle = ""
+            try:
+                previous_handle = switch_to_cartola_window(state, driver)
+                state.status = "Consultando cartola..."
+                state.progress_status = "Consultando cartola"
+                state.progress_value = 80.0
+                state.cartola_data = apply_cartola_filters_and_consult(
+                    driver,
+                    account=payload.account.strip(),
+                    start_date=payload.start_date.strip(),
+                    end_date=payload.end_date.strip(),
+                    log_callback=state.append_log,
+                )
+                state.append_log(
+                    "Cartola: consulta actualizada "
+                    + f"movimientos={len(state.cartola_data.get('movements') or [])}"
+                )
+            except Exception as exc:
+                detail = str(exc)
+                if is_cartola_debug_enabled():
+                    dump_dir = write_cartola_debug_dump(
+                        driver,
+                        context={
+                            "stage": "cartola_consult",
+                            "payload": payload.model_dump(),
+                            "error": str(exc),
+                        },
+                    )
+                    state.append_log(f"Cartola: dump de debug generado en {dump_dir}")
+                    detail += f" | dump={dump_dir}"
+                raise HTTPException(status_code=400, detail=detail) from exc
+            finally:
+                if previous_handle:
+                    try:
+                        driver.switch_to.window(previous_handle)
+                        driver.switch_to.default_content()
+                    except WebDriverException:
+                        pass
+
+            state.status = "Cartola actualizada"
+            state.progress_status = "Cartola actualizada"
+            state.progress_value = 100.0
+            return {"ok": True, "cartola": state.cartola_data}
+
+    return await run_browser_job_async(job)
 
 
 @app.post("/api/cartola-export-xls")
-def api_cartola_export_xls(request: Request, response: Response) -> dict[str, Any]:
+async def api_cartola_export_xls(request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
     with state.lock:
         require_session(state)
@@ -1764,54 +1817,62 @@ def api_cartola_excel(excel_id: str, request: Request, response: Response) -> Re
 
 
 @app.post("/api/case-history")
-def api_case_history(payload: HistoryDetailPayload, request: Request, response: Response) -> dict[str, Any]:
+async def api_case_history(payload: HistoryDetailPayload, request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
-    with state.lock:
-        driver = require_session(state)
-        state.append_log("Historia secundaria solicitada para " + payload.rit)
-        state.detail_rit = payload.rit
-        state.detail_rows = []
-        state.detail_status = "Consultando historia de " + payload.rit
-        try:
-            history_rows = consult_history_only(driver, payload.rit, log_callback=state.append_log)
-        except Exception as exc:
-            state.detail_status = "No se pudo consultar la historia de " + payload.rit
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        state.detail_rows = history_rows
-        state.detail_status = "Historia cargada para " + payload.rit
-        return {"ok": True, "rit": payload.rit, "history": history_rows}
+    def job() -> dict[str, Any]:
+        with state.lock:
+            driver = require_session(state)
+            state.append_log("Historia secundaria solicitada para " + payload.rit)
+            state.detail_rit = payload.rit
+            state.detail_rows = []
+            state.detail_status = "Consultando historia de " + payload.rit
+            try:
+                history_rows = consult_history_only(driver, payload.rit, log_callback=state.append_log)
+            except Exception as exc:
+                state.detail_status = "No se pudo consultar la historia de " + payload.rit
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+            state.detail_rows = history_rows
+            state.detail_status = "Historia cargada para " + payload.rit
+            return {"ok": True, "rit": payload.rit, "history": history_rows}
+
+    return await run_browser_job_async(job)
 
 
 @app.post("/api/open-pdf")
-def api_open_pdf(payload: OpenPdfPayload, request: Request, response: Response) -> dict[str, Any]:
+async def api_open_pdf(payload: OpenPdfPayload, request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
-    with state.lock:
-        driver = require_session(state)
-        pdf_url = payload.pdf_url.strip()
-        if not pdf_url:
-            raise HTTPException(status_code=400, detail="La fila no tiene PDF asociado")
 
-        try:
-            artifact = prepare_pdf_artifact(state, driver, pdf_url, payload.prefix)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    def job() -> dict[str, Any]:
+        with state.lock:
+            driver = require_session(state)
+            pdf_url = payload.pdf_url.strip()
+            if not pdf_url:
+                raise HTTPException(status_code=400, detail="La fila no tiene PDF asociado")
 
-        custom_title = payload.pdf_title.strip()
-        if custom_title:
-            artifact.display_name = custom_title
+            try:
+                artifact = prepare_pdf_artifact(state, driver, pdf_url, payload.prefix)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        pdf_id = uuid.uuid4().hex
-        state.pdf_files[pdf_id] = artifact
-        state.current_pdf_id = pdf_id
-        state.append_log("Documento abierto: " + artifact.display_name)
-        return {"ok": True, "id": pdf_id, "url": "/api/pdf/" + pdf_id, "name": artifact.display_name}
+            custom_title = payload.pdf_title.strip()
+            if custom_title:
+                artifact.display_name = custom_title
+
+            pdf_id = uuid.uuid4().hex
+            state.pdf_files[pdf_id] = artifact
+            state.current_pdf_id = pdf_id
+            state.append_log("Documento abierto: " + artifact.display_name)
+            return {"ok": True, "id": pdf_id, "url": "/api/pdf/" + pdf_id, "name": artifact.display_name}
+
+    return await run_browser_job_async(job)
 
 
 @app.post("/api/close-pdf")
-def api_close_pdf(payload: ClosePdfPayload, request: Request, response: Response) -> dict[str, Any]:
+async def api_close_pdf(payload: ClosePdfPayload, request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
     with state.lock:
         target_id = (payload.pdf_id or state.current_pdf_id).strip()
@@ -1837,7 +1898,7 @@ def api_pdf(pdf_id: str, request: Request, response: Response):
 
 
 @app.post("/api/logout")
-def api_logout(request: Request, response: Response) -> dict[str, Any]:
+async def api_logout(request: Request, response: Response) -> dict[str, Any]:
     state = get_session_state(request, response)
     close_state(state.session_id)
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
@@ -2802,6 +2863,7 @@ HTML_PAGE = """
         refresh: '<path d="M20 6v5h-5"/><path d="M20 11a8 8 0 1 0 2 5.3"/><path d="M4 18v-5h5"/>',
         logout: '<path d="M14 17h2.5A2.5 2.5 0 0 0 19 14.5v-9A2.5 2.5 0 0 0 16.5 3H14"/><path d="M4 12h11"/><path d="M8 8l-4 4 4 4"/><path d="M14 17H6.5A2.5 2.5 0 0 1 4 14.5v-9A2.5 2.5 0 0 1 6.5 3H14"/>',
         pdf: '<path d="M7 2.5h8.5l4.5 4.5V22H7z" fill="#fff" stroke="#ef4444" stroke-width="1.7" stroke-linejoin="round"/><path d="M15.5 2.5V7h4.5" fill="none" stroke="#ef4444" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="9" y="10.3" width="9.5" height="7.2" rx="1.6" fill="#ef4444"/><text x="13.75" y="15.15" text-anchor="middle" font-family="Arial, sans-serif" font-size="4.4" font-weight="800" fill="#ffffff">PDF</text>',
+        doc: '<path d="M7 2.5h8.5l4.5 4.5V22H7z" fill="#fff" stroke="#2563eb" stroke-width="1.7" stroke-linejoin="round"/><path d="M15.5 2.5V7h4.5" fill="none" stroke="#2563eb" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="8.7" y="10.3" width="9.8" height="7.2" rx="1.6" fill="#2563eb"/><text x="13.6" y="15.15" text-anchor="middle" font-family="Arial, sans-serif" font-size="4.0" font-weight="800" fill="#ffffff">DOC</text>',
         arrowRight: '<path d="M5 12h14"/><path d="M13 6l6 6-6 6"/>',
         external: '<path d="M14 5h5v5"/><path d="M10 14L19 5"/><path d="M19 14v5H5V5h5"/>',
         close: '<path d="M6 6l12 12"/><path d="M18 6L6 18"/>',
@@ -2997,7 +3059,7 @@ HTML_PAGE = """
       }
       var parts = [
         rowData["Sujeto"],
-        rowData["Nombre o Razón Social"],
+        rowData["Nombre o Razón Social"] || rowData["Nombre o Razon Social"],
         rowData["Rut/Pasaporte"]
       ];
       var text = [];
@@ -3294,7 +3356,8 @@ HTML_PAGE = """
                 btn.type = "button";
                 btn.className = "pdf-action";
                 btn.title = "Abrir PDF";
-                btn.innerHTML = iconSvg("pdf");
+                var fileKind = String(rowData.file_kind || "").toLowerCase();
+                btn.innerHTML = iconSvg(fileKind === "word" ? "doc" : "pdf");
                 btn.onclick = function () {
                   var pdfTitle = getPdfTitleForRow(rowData, sectionNameInner);
                   xhrRequest("POST", "/api/open-pdf", { pdf_url: rowData.pdf_url, prefix: sectionNameInner, pdf_title: pdfTitle }, function (status, data) {

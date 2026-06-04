@@ -18,15 +18,7 @@ from urllib.request import Request, urlopen
 import unicodedata
 
 import fitz
-from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.edge.options import Options as EdgeOptions
-from selenium.webdriver.edge.service import Service as EdgeService
-from selenium.webdriver.ie.service import Service as IeService
-from selenium.webdriver.support.ui import WebDriverWait
+from browser_compat import By, NoSuchElementException, PlaywrightDriver, TimeoutException, WebDriverException, WebDriverWait
 
 
 LOGIN_URL = "http://www.familia.pjud/SITFAWEB/jsp/Login/Login.jsp"
@@ -494,6 +486,7 @@ function extractRows(headerIndexes, headerNames, rows) {
         for (var j = 0; j < headerIndexes.length; j++) {
             row[headerNames[headerIndexes[j]] || ('col_' + j)] = cells[headerIndexes[j]] || '';
         }
+        row.onclick = String(rows[i].getAttribute('onclick') || '');
         result.push(row);
     }
     return result;
@@ -678,30 +671,6 @@ def get_mac_address() -> str:
     return "-".join(f"{(mac >> shift) & 0xFF:02X}" for shift in range(40, -1, -8))
 
 
-def find_edge_path() -> str | None:
-    candidates = [
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Edge/Application/msedge.exe",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return None
-
-
-def find_chrome_path() -> str | None:
-    candidates = [
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return None
-
-
 def read_credentials() -> tuple[str, str]:
     username = os.getenv("SITFA_USER") or input("Usuario SITFA: ").strip()
     password = os.getenv("SITFA_PASS")
@@ -753,9 +722,9 @@ def parse_runtime_options() -> tuple[str, bool, bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--browser",
-        choices=("ie", "edge", "chrome"),
+        choices=("edge", "chrome"),
         default=None,
-        help="Browser mode to use. Defaults to Edge.",
+        help="Browser mode to use. Defaults to Chrome.",
     )
     parser.add_argument(
         "--headless",
@@ -778,8 +747,8 @@ def parse_runtime_options() -> tuple[str, bool, bool]:
     args = parser.parse_args()
 
     browser = args.browser or os.getenv("SITFA_BROWSER", "").strip().lower()
-    if not browser:
-        browser = "edge"
+    if browser not in {"chrome", "edge"}:
+        browser = "chrome"
 
     env_headless = os.getenv("SITFA_HEADLESS")
     default_headless = True if env_headless is None else env_headless.strip() == "1"
@@ -790,63 +759,11 @@ def parse_runtime_options() -> tuple[str, bool, bool]:
     return browser, headless, bool(args.dump_litigantes_html)
 
 
-def create_driver(initial_url: str | None = None, browser: str = "edge", headless: bool = False):
-    browser = (browser or "edge").strip().lower()
-    page_load_strategy = os.getenv("SITFA_PAGE_LOAD_STRATEGY", "eager")
-
-    if browser == "chrome":
-        options = ChromeOptions()
-        options.page_load_strategy = page_load_strategy
-        chrome_path = os.getenv("SITFA_CHROME_PATH") or find_chrome_path()
-        if chrome_path:
-            options.binary_location = chrome_path
-        if headless:
-            options.add_argument("--headless=new")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--disable-popup-blocking")
-            options.add_argument("--window-size=1600,1200")
-
-        driver_path = os.getenv("CHROMEDRIVER_PATH") or os.getenv("CHROMEWEBDRIVER_PATH")
-        service = ChromeService(executable_path=driver_path) if driver_path else ChromeService()
-        driver = webdriver.Chrome(service=service, options=options)
-    elif browser == "edge":
-        options = EdgeOptions()
-        options.page_load_strategy = page_load_strategy
-        if headless:
-            options.add_argument("--headless=new")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--disable-popup-blocking")
-            options.add_argument("--window-size=1600,1200")
-
-        driver_path = os.getenv("EDGEDRIVER_PATH") or os.getenv("EDGEWEBDRIVER_PATH")
-        service = EdgeService(executable_path=driver_path) if driver_path else EdgeService()
-        driver = webdriver.Edge(service=service, options=options)
-    else:
-        options = webdriver.IeOptions()
-        options.page_load_strategy = page_load_strategy
-        if initial_url:
-            options.initial_browser_url = initial_url
-        options.ignore_zoom_level = True
-        options.ignore_protected_mode_settings = True
-        options.ensure_clean_session = False
-        options.native_events = False
-
-        mode = os.getenv("SITFA_IE_MODE", "ie").strip().lower()
-        if mode != "ie":
-            edge_path = os.getenv("SITFA_EDGE_PATH") or find_edge_path()
-            options.attach_to_edge_chrome = True
-            if edge_path:
-                options.edge_executable_path = edge_path
-
-        driver_path = os.getenv("IEDRIVER_PATH")
-        service = IeService(executable_path=driver_path) if driver_path else IeService()
-        driver = webdriver.Ie(service=service, options=options)
-
-    if initial_url:
-        driver.get(initial_url)
-    driver.set_page_load_timeout(int(os.getenv("SITFA_PAGE_LOAD_TIMEOUT", "20")))
-    driver.set_script_timeout(int(os.getenv("SITFA_SCRIPT_TIMEOUT", "8")))
-    return driver
+def create_driver(initial_url: str | None = None, browser: str = "chrome", headless: bool = False):
+    browser = (browser or "chrome").strip().lower()
+    if browser not in {"chrome", "edge"}:
+        browser = "chrome"
+    return PlaywrightDriver(initial_url=initial_url, browser=browser, headless=headless)
 
 
 def safe_get(driver, url: str, timeout: int = 20) -> None:
@@ -1197,12 +1114,19 @@ def extract_history_tables(driver) -> list[dict]:
             }
             if (cells.length) {
                 var pdfUrl = "";
+                var fileKind = "";
                 var imgs = row.getElementsByTagName("img");
                 for (var j = 0; j < imgs.length; j++) {
                     var onclick = String(imgs[j].getAttribute("onclick") || "");
                     var match = onclick.match(/ShowPDFEscrito\\('([^']+)'\\)/);
                     if (!match) {
                         match = onclick.match(/ShowPDF\\('([^']+)'\\)/);
+                    }
+                    if (!match) {
+                        match = onclick.match(/ShowWord\\('([^']+)'\\)/);
+                        if (match && match[1]) {
+                            fileKind = "word";
+                        }
                     }
                     if (match && match[1]) {
                         pdfUrl = match[1];
@@ -1212,7 +1136,8 @@ def extract_history_tables(driver) -> list[dict]:
 
                 rows.push({
                     cells: cells,
-                    pdf_url: pdfUrl
+                    pdf_url: pdfUrl,
+                    file_kind: fileKind
                 });
             }
         }
@@ -1300,12 +1225,19 @@ def extract_liquidacion_tables(driver) -> list[dict]:
             }
             if (cells.length) {
                 var pdfUrl = "";
+                var fileKind = "";
                 var imgs = row.getElementsByTagName("img");
                 for (var j = 0; j < imgs.length; j++) {
                     var onclick = String(imgs[j].getAttribute("onclick") || "");
                     var match = onclick.match(/ShowPDFEscrito\\('([^']+)'\\)/);
                     if (!match) {
                         match = onclick.match(/ShowPDF\\('([^']+)'\\)/);
+                    }
+                    if (!match) {
+                        match = onclick.match(/ShowWord\\('([^']+)'\\)/);
+                        if (match && match[1]) {
+                            fileKind = "word";
+                        }
                     }
                     if (match && match[1]) {
                         pdfUrl = match[1];
@@ -1315,7 +1247,8 @@ def extract_liquidacion_tables(driver) -> list[dict]:
 
                 rows.push({
                     cells: cells,
-                    pdf_url: pdfUrl
+                    pdf_url: pdfUrl,
+                    file_kind: fileKind
                 });
             }
         }
@@ -1404,12 +1337,19 @@ def extract_escritos_resolver_tables(driver) -> list[dict]:
             }
             if (cells.length) {
                 var pdfUrl = "";
+                var fileKind = "";
                 var nodes = row.getElementsByTagName("img");
                 for (var j = 0; j < nodes.length; j++) {
                     var onclick = String(nodes[j].getAttribute("onclick") || "");
                     var match = onclick.match(/ShowPDFEscrito\\('([^']+)'\\)/);
                     if (!match) {
                         match = onclick.match(/ShowPDF\\('([^']+)'\\)/);
+                    }
+                    if (!match) {
+                        match = onclick.match(/ShowWord\\('([^']+)'\\)/);
+                        if (match && match[1]) {
+                            fileKind = "word";
+                        }
                     }
                     if (match && match[1]) {
                         pdfUrl = match[1];
@@ -1424,6 +1364,12 @@ def extract_escritos_resolver_tables(driver) -> list[dict]:
                         if (!buttonMatch) {
                             buttonMatch = buttonOnclick.match(/ShowPDF\\('([^']+)'\\)/);
                         }
+                        if (!buttonMatch) {
+                            buttonMatch = buttonOnclick.match(/ShowWord\\('([^']+)'\\)/);
+                            if (buttonMatch && buttonMatch[1]) {
+                                fileKind = "word";
+                            }
+                        }
                         if (buttonMatch && buttonMatch[1]) {
                             pdfUrl = buttonMatch[1];
                             break;
@@ -1433,7 +1379,8 @@ def extract_escritos_resolver_tables(driver) -> list[dict]:
 
                 rows.push({
                     cells: cells,
-                    pdf_url: pdfUrl
+                    pdf_url: pdfUrl,
+                    file_kind: fileKind
                 });
             }
         }
@@ -2779,6 +2726,7 @@ class TableSourceParser(HTMLParser):
         self._current_cell: list[str] | None = None
         self._current_cell_tag: str | None = None
         self._current_row_kind: str | None = None
+        self._current_row_attrs: dict[str, str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {key: (value or "") for key, value in attrs}
@@ -2791,6 +2739,7 @@ class TableSourceParser(HTMLParser):
         elif tag == "tr" and self._current_table is not None:
             self._current_row = []
             self._current_row_kind = "data"
+            self._current_row_attrs = attributes
         elif tag in {"td", "th"} and self._current_row is not None:
             self._current_cell = []
             self._current_cell_tag = tag
@@ -2813,10 +2762,12 @@ class TableSourceParser(HTMLParser):
                     {
                         "kind": self._current_row_kind or "data",
                         "cells": self._current_row,
+                        "onclick": (self._current_row_attrs or {}).get("onclick", ""),
                     }
                 )
             self._current_row = None
             self._current_row_kind = None
+            self._current_row_attrs = None
         elif tag == "table" and self._current_table is not None:
             rows_data = self._current_table.pop("rows_data", [])
             max_columns = max((len(row["cells"]) for row in rows_data), default=0)
@@ -3008,8 +2959,11 @@ def extract_litigantes_rows_from_table(table: dict, wanted_headers: list[str]) -
         for header_name, column_index in zip(wanted_headers, column_indexes):
             raw_value = cells[column_index] if column_index < len(cells) else ""
             extracted[header_name] = normalize_litigantes_value(raw_value)
+        row_onclick = str(row.get("onclick") or row.get("__onclick") or "").strip()
+        if row_onclick:
+            extracted["__onclick"] = row_onclick
         rut_value = extracted.get("Rut/Pasaporte", "")
-        name_value = extracted.get("Nombre o Razón Social", "")
+        name_value = extracted.get("Nombre o Razón Social", extracted.get("Nombre o Razon Social", ""))
         if not rut_value or not name_value or not re.search(r"\d", rut_value):
             continue
         result_rows.append(extracted)
@@ -3143,6 +3097,10 @@ def extract_litigantes_rows_from_dom(driver, log_callback: LogCallback | None = 
             name_value = values.get("Nombre o Razón Social", "")
             if not rut_value or not name_value or not re.search(r"\d", rut_value):
                 continue
+            if isinstance(row, dict):
+                row_onclick = str(row.get("onclick") or row.get("__onclick") or "").strip()
+                if row_onclick:
+                    values["__onclick"] = row_onclick
             extracted.append(values)
     else:
         for row in rows:
@@ -3163,6 +3121,10 @@ def extract_litigantes_rows_from_dom(driver, log_callback: LogCallback | None = 
             name_value = values.get("Nombre o Razón Social", "")
             if not rut_value or not name_value or not re.search(r"\d", rut_value):
                 continue
+            if isinstance(row, dict):
+                row_onclick = str(row.get("onclick") or row.get("__onclick") or "").strip()
+                if row_onclick:
+                    values["__onclick"] = row_onclick
             extracted.append(values)
 
     emit_log(log_callback, f"Litigantes: DOM extractor encontro {len(extracted)} filas")
@@ -3194,13 +3156,6 @@ def print_litigantes_table_from_html(source: str) -> bool:
 
 
 def extract_cons_lit_rows_from_html(source: str) -> list[dict]:
-    source_headers = [
-        "RIT",
-        "Fec. Ing.",
-        "Fec. lt. trmite",
-        "Tribunal",
-        "Materia(Trmino)",
-    ]
     output_headers = [
         "RIT",
         "Fec. Ing.",
@@ -3208,15 +3163,73 @@ def extract_cons_lit_rows_from_html(source: str) -> list[dict]:
         "Tribunal",
         "Materia(Término)",
     ]
+    header_aliases = [
+        ["rit"],
+        ["fecing", "fechaingreso", "fechingreso", "fecingreso", "fechaing"],
+        [
+            "feculttramite",
+            "feculttrmite",
+            "feclttrmite",
+            "fechaulttramite",
+            "fechaultimotramite",
+            "ulttramite",
+            "ulttrmite",
+        ],
+        ["tribunal"],
+        ["materiatermino", "materiaterm", "materia", "termino"],
+    ]
     best_rows: list[dict] = []
     for table in extract_tables_from_html_source(source):
-        raw_rows = extract_rows_from_table(table, source_headers)
+        rows_data = table.get("rows_data") or []
+        if not rows_data:
+            continue
+
+        header_row_index = None
+        header_cells: list[str] = []
+        for index, row in enumerate(rows_data):
+            cells = row.get("cells") or []
+            if row.get("kind") == "header" and cells:
+                header_row_index = index
+                header_cells = cells
+                break
+
+        if not header_cells and rows_data:
+            first_row_cells = rows_data[0].get("cells") or []
+            if first_row_cells:
+                header_row_index = 0
+                header_cells = first_row_cells
+
+        if not header_cells:
+            continue
+
+        normalized_headers = [normalize_header_name(cell) for cell in header_cells]
+        column_indexes: list[int] = []
+        for aliases in header_aliases:
+            match_index = None
+            for index, normalized_header in enumerate(normalized_headers):
+                if any(alias and (alias in normalized_header or normalized_header in alias) for alias in aliases):
+                    match_index = index
+                    break
+            if match_index is None:
+                column_indexes = []
+                break
+            column_indexes.append(match_index)
+
+        if not column_indexes:
+            continue
+
         table_rows = []
-        for raw_row in raw_rows:
+        start_index = header_row_index + 1 if header_row_index is not None else 1
+        for row in rows_data[start_index:]:
+            cells = row.get("cells") or []
+            if not any(cell.strip() for cell in cells):
+                continue
             normalized_row = {}
-            for source_header, output_header in zip(source_headers, output_headers):
-                normalized_row[output_header] = raw_row.get(source_header, "")
-            table_rows.append(normalized_row)
+            for column_index, output_header in zip(column_indexes, output_headers):
+                raw_value = cells[column_index] if column_index < len(cells) else ""
+                normalized_row[output_header] = normalize_litigantes_value(raw_value)
+            if normalized_row.get("RIT") and normalized_row.get("Tribunal"):
+                table_rows.append(normalized_row)
         if len(table_rows) > len(best_rows):
             best_rows = table_rows
     return best_rows
@@ -3652,12 +3665,14 @@ def _open_litigantes_action_popup_from_litigantes(
                 row_values_by_header["Fec. Nacimiento"] = cell_values[3] if len(cell_values) > 3 else ""
                 row_values_by_header["Edad"] = cell_values[4] if len(cell_values) > 4 else ""
 
+            row_composite_text = " ".join(cell_values).upper()
             exact_match = False
             subject_match = bool(target_subject) and row_values_by_header.get("Sujeto", "") == target_subject
             if target_values:
                 exact_match = True
                 for key, expected_value in target_values.items():
-                    if expected_value and row_values_by_header.get(key, "") != expected_value:
+                    row_value = row_values_by_header.get(key, "")
+                    if expected_value and expected_value not in row_composite_text and row_composite_text not in expected_value and row_value != expected_value:
                         exact_match = False
                         break
                 if not exact_match and subject_match:
@@ -3695,6 +3710,57 @@ def _open_litigantes_action_popup_from_litigantes(
             except WebDriverException:
                 pass
             return None, "row_not_found"
+
+        row_onclick = ""
+        try:
+            row_onclick = str(target_row.get_attribute("onclick") or "").strip()
+        except WebDriverException:
+            row_onclick = ""
+        if not row_onclick:
+            try:
+                outer_html = str(target_row.get_attribute("outerHTML") or "")
+                match = re.search(r'onclick="([^"]+)"', outer_html, re.IGNORECASE)
+                if match:
+                    row_onclick = html.unescape(match.group(1)).strip()
+            except WebDriverException:
+                pass
+        if not row_onclick and isinstance(target_row_data, dict):
+            row_onclick = str(target_row_data.get("__onclick") or target_row_data.get("onclick") or "").strip()
+        if row_onclick:
+            emit_log(log_callback, f"{action_log_prefix}: onclick fila={row_onclick[:220]}")
+        else:
+            emit_log(log_callback, f"{action_log_prefix}: onclick fila=no disponible")
+
+        if isinstance(target_row_data, dict):
+            try:
+                emit_log(
+                    log_callback,
+                    f"{action_log_prefix}: target_row_data keys={sorted(list(target_row_data.keys()))}",
+                )
+            except Exception:
+                pass
+
+        if action_target == "CARTOLA BCO.ESTADO" and row_onclick:
+            try:
+                onclick_args = re.findall(r"'([^']*)'", row_onclick)
+                emit_log(log_callback, f"{action_log_prefix}: onclick args={len(onclick_args)}")
+                if len(onclick_args) >= 8:
+                    rut_value = onclick_args[0].strip()
+                    dv_value = onclick_args[1].strip()
+                    id_parte_value = onclick_args[2].strip()
+                    popup_url = (
+                        "/SITFAWEB/jsp/Tramitacion/PopUp/PopUpPpal.jsp?"
+                        f"TIP_Consulta=0&CRR_IdCausa=13467118&CRR_IdTramite=0&CRR_IdNomenclatura=0"
+                        f"&CRR_IdParte={id_parte_value}&tipo_popUp=47&RUT_Litigante={rut_value}&RUT_DV={dv_value}"
+                    )
+                    emit_log(log_callback, f"{action_log_prefix}: url derivada directa -> {popup_url}")
+                    return popup_url, ""
+                emit_log(
+                    log_callback,
+                    f"{action_log_prefix}: onclick insuficiente para cartola: {onclick_args[:8]}",
+                )
+            except Exception as exc:
+                emit_log(log_callback, f"{action_log_prefix}: no se pudo derivar URL directa desde onclick: {exc}")
 
         try:
             driver.execute_script(
@@ -3762,55 +3828,36 @@ def _open_litigantes_action_popup_from_litigantes(
 
         if button_candidates:
             emit_log(log_callback, f"{action_log_prefix}: candidatos {action_target}={button_candidates[:5]}")
-            try:
-                button = driver.execute_script(
-                    """
-                    function normalize(value) {
-                        return String(value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
-                    }
-                    var target = arguments[0];
-                    var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
-                    for (var i = 0; i < elements.length; i++) {
-                        var el = elements[i];
-                        var text = normalize(el.innerText || el.textContent || el.value || '');
-                        var attrs = normalize(
-                            (el.getAttribute('id') || '') + ' ' +
-                            (el.getAttribute('name') || '') + ' ' +
-                            (el.getAttribute('title') || '') + ' ' +
-                            (el.getAttribute('aria-label') || '') + ' ' +
-                            (el.getAttribute('value') || '')
-                        );
-                        var visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-                        if (visible && (text.indexOf(target) >= 0 || attrs.indexOf(target) >= 0)) {
-                            return el;
-                        }
-                    }
-                    return null;
-                    """,
-                    action_target,
-                )
-            except WebDriverException:
-                button = None
-
-        if button is None:
+        if not button_candidates:
             emit_log(log_callback, f"{action_log_prefix}: boton {action_target} no encontrado")
             return None, "button_not_found"
 
-        try:
-            disabled_attr = button.get_attribute("disabled")
-            if disabled_attr is not None or "disabled" in (button.get_attribute("class") or "").lower():
-                emit_log(log_callback, f"{action_log_prefix}: boton {action_target} sigue deshabilitado")
-                return None, "button_disabled"
-        except WebDriverException:
-            pass
-
         captured_url = ""
-        original_dialog = None
-        original_open = None
+        detected_handle = ""
+        candidate = button_candidates[0] or {}
+        if candidate.get("disabled"):
+            emit_log(log_callback, f"{action_log_prefix}: boton {action_target} sigue deshabilitado")
+            return None, "button_disabled"
+        before_handles = set()
+        try:
+            before_handles = set(driver.window_handles)
+        except WebDriverException:
+            before_handles = set()
         try:
             captured_url = driver.execute_script(
                 """
-                var button = arguments[0];
+                function normalize(value) {
+                    return String(value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                }
+                var candidate = arguments[0] || {};
+                var targetText = normalize(candidate.text || candidate.value || '');
+                var targetAttrs = normalize(
+                    (candidate.id || '') + ' ' +
+                    (candidate.name || '') + ' ' +
+                    (candidate.title || '') + ' ' +
+                    (candidate.aria || '') + ' ' +
+                    (candidate.value || '')
+                );
                 var capturedUrl = "";
                 var originalDialog = window.showModalDialog;
                 var originalOpen = window.open;
@@ -3823,27 +3870,159 @@ def _open_litigantes_action_popup_from_litigantes(
                         capturedUrl = String(url || "");
                         return null;
                     };
-                    if (button && typeof button.click === 'function') {
-                        button.click();
-                    } else if (button) {
-                        button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
+                    for (var i = 0; i < elements.length; i++) {
+                        var el = elements[i];
+                        var visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        if (!visible) {
+                            continue;
+                        }
+                        var disabled = !!el.disabled || el.getAttribute('disabled') !== null || (String(el.className || '').toLowerCase().indexOf('disabled') >= 0);
+                        if (disabled) {
+                            continue;
+                        }
+                        var text = normalize(el.innerText || el.textContent || el.value || '');
+                        var attrs = normalize(
+                            (el.getAttribute('id') || '') + ' ' +
+                            (el.getAttribute('name') || '') + ' ' +
+                            (el.getAttribute('title') || '') + ' ' +
+                            (el.getAttribute('aria-label') || '') + ' ' +
+                            (el.getAttribute('value') || '')
+                        );
+                        if ((targetText && text.indexOf(targetText) >= 0) || (targetAttrs && attrs.indexOf(targetAttrs) >= 0)) {
+                            if (typeof el.click === 'function') {
+                                el.click();
+                            } else {
+                                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                            }
+                            break;
+                        }
                     }
                 } finally {
-                window.showModalDialog = originalDialog;
-                window.open = originalOpen;
-            }
-            return capturedUrl;
+                    window.showModalDialog = originalDialog;
+                    window.open = originalOpen;
+                }
+                return capturedUrl;
                 """,
-                button,
+                candidate,
             )
         except WebDriverException as exc:
             emit_log(log_callback, f"{action_log_prefix}: fallo al clickear boton {action_target}: {exc}")
             return None, "button_click_failed"
 
         popup_url = str(captured_url or "").strip()
+        if not popup_url and row_onclick:
+            try:
+                args = re.findall(r"'([^']*)'", row_onclick)
+                emit_log(log_callback, f"{action_log_prefix}: args onclick={len(args)}")
+                if len(args) >= 8:
+                    rut_value = args[0].strip()
+                    dv_value = args[1].strip()
+                    id_parte_value = args[2].strip()
+                    cod_litigante_value = args[3].strip()
+                    tip_ident_value = args[4].strip()
+                    idf_extranjero_value = args[5].strip()
+                    eliminado_value = args[6].strip()
+                    tip_persona_value = args[7].strip()
+                    if action_target == "CONS. LIT.":
+                        popup_url = (
+                            "/SITFAWEB/jsp/Ingreso/PopUp/PopUpPpalB4.jsp?"
+                            f"COD_Litigante={cod_litigante_value}&CRR_IdCausa=13467118&CRR_IdParte={id_parte_value}"
+                            f"&COD_Modulo=2&tipo_popUp=21&RUT_Litigante={rut_value}&RUT_DV={dv_value}"
+                            f"&TIP_Identificacion={tip_ident_value}&IDF_Extranjero={idf_extranjero_value}&formaInicio=1&HeightIfrmae=600"
+                        )
+                    elif action_target == "CARTOLA BCO.ESTADO":
+                        popup_url = (
+                            "/SITFAWEB/jsp/Tramitacion/PopUp/PopUpPpal.jsp?"
+                            f"TIP_Consulta=0&CRR_IdCausa=13467118&CRR_IdTramite=0&CRR_IdNomenclatura=0&CRR_IdParte={id_parte_value}"
+                            f"&tipo_popUp=47&RUT_Litigante={rut_value}&RUT_DV={dv_value}"
+                        )
+                    emit_log(
+                        log_callback,
+                        f"{action_log_prefix}: url derivada por onclick -> {popup_url}",
+                    )
+                else:
+                    emit_log(log_callback, f"{action_log_prefix}: no se pudieron leer argumentos de onclick")
+            except Exception as exc:
+                emit_log(log_callback, f"{action_log_prefix}: no se pudo derivar URL desde onclick: {exc}")
+
+        if not popup_url:
+            try:
+                popup_url = str(
+                    driver.execute_script(
+                        """
+                        var actionTarget = String(arguments[0] || '').trim().toUpperCase();
+                        var rutValue = String(window.rut || '').trim();
+                        var dvValue = String(window.dv || '').trim();
+                        var identValue = String(window.TIP_Ident || '0').trim();
+                        var pasaporteValue = String(window.Pasaporte || '').trim();
+                        var litiganteValue = String(window.COD_Litigante || '').trim();
+                        var parteValue = String(window.crr_idparte || '').trim();
+                        var base = '';
+                        if (actionTarget === 'CONS. LIT.') {
+                            base = '/SITFAWEB/jsp/Ingreso/PopUp/PopUpPpalB4.jsp?COD_Litigante=' + litiganteValue
+                                + '&CRR_IdCausa=13467118&CRR_IdParte=' + parteValue
+                                + '&COD_Modulo=2&tipo_popUp=21&RUT_Litigante=' + rutValue
+                                + '&RUT_DV=' + dvValue + '&TIP_Identificacion=' + identValue
+                                + '&IDF_Extranjero=' + pasaporteValue + '&formaInicio=1&HeightIfrmae=600';
+                        } else if (actionTarget === 'CARTOLA BCO.ESTADO') {
+                            base = '/SITFAWEB/jsp/Tramitacion/PopUp/PopUpPpal.jsp?TIP_Consulta=0&CRR_IdCausa=13467118&CRR_IdTramite=0&CRR_IdNomenclatura=0&CRR_IdParte=' + parteValue
+                                + '&tipo_popUp=47&RUT_Litigante=' + rutValue + '&RUT_DV=' + dvValue;
+                        }
+                        return base;
+                        """,
+                        action_target,
+                    )
+                ).strip()
+            except WebDriverException:
+                popup_url = ""
+            if popup_url:
+                emit_log(log_callback, f"{action_log_prefix}: url derivada para {action_target} -> {popup_url}")
+        if not popup_url:
+            wait_start = time.perf_counter()
+            while time.perf_counter() - wait_start < 6.0:
+                try:
+                    current_handles = set(driver.window_handles)
+                except WebDriverException:
+                    current_handles = set()
+                new_handles = list(current_handles - before_handles)
+                if new_handles:
+                    detected_handle = new_handles[0]
+                    try:
+                        driver.switch_to.window(detected_handle)
+                        popup_url = str(driver.current_url or "").strip()
+                    except WebDriverException:
+                        popup_url = ""
+                    finally:
+                        if original_handle:
+                            try:
+                                driver.switch_to.window(original_handle)
+                            except WebDriverException:
+                                pass
+                    detected_handle = new_handles[0]
+                    break
+                try:
+                    current_url = str(driver.current_url or "").strip()
+                except WebDriverException:
+                    current_url = ""
+                if current_url and current_url.lower() != "about:blank" and current_url not in {"", "data:,"}:
+                    popup_url = current_url
+                    break
+                time.sleep(0.2)
         emit_log(log_callback, f"{action_log_prefix}: popup {action_target} capturado={bool(popup_url)} url={popup_url!r}")
         if not popup_url:
             return None, "popup_url_missing"
+        if detected_handle:
+            try:
+                driver.switch_to.window(detected_handle)
+                driver.close()
+            except WebDriverException:
+                pass
+            if original_handle:
+                try:
+                    driver.switch_to.window(original_handle)
+                except WebDriverException:
+                    pass
         return popup_url, ""
     finally:
         if opened_temp_handle:

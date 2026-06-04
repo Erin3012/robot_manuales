@@ -21,7 +21,7 @@ Si vas a seguir trabajando en este repo, empieza por estos archivos:
 - `run_web.py`: lanzador de la version web.
 
 ## Dependencias
-- `selenium`
+- `playwright`
 - `fastapi`
 - `uvicorn`
 - `PyMuPDF`
@@ -29,4 +29,7 @@ Si vas a seguir trabajando en este repo, empieza por estos archivos:
 
 ## Nota
 - El archivo `.env` se carga automaticamente desde `main.py`.
+- Chrome es el navegador por defecto para CLI y la version web. Puedes overridearlo con `SITFA_BROWSER` o `SITFA_WEB_BROWSER`; `SITFA_WEB_HEADLESS=0` desactiva el modo headless en la web.
+- Si necesitas forzar el canal de Playwright, usa `SITFA_PLAYWRIGHT_CHANNEL` (`chrome` o `msedge`).
+- Si instalas dependencias desde cero, recuerda ejecutar `playwright install chromium` para tener el navegador disponible.
 - Si cambias un flujo importante, actualiza tambien `AI_CONTEXT.md` y `STATUS.md`.

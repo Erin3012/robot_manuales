@@ -5,6 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urljoin
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -64,9 +65,17 @@ def _selector_for(by: str, value: str) -> str:
     raise WebDriverException(f"Localizador no soportado: {by}")
 
 
-def _translate_script(script: str) -> str:
-    translated = script.replace("arguments[0]", "arg0").replace("arguments[1]", "arg1")
-    return translated
+def _translate_script(script: str) -> tuple[str, int]:
+    max_index = -1
+
+    def replace_argument(match: re.Match[str]) -> str:
+        nonlocal max_index
+        index = int(match.group(1))
+        max_index = max(max_index, index)
+        return f"arg{index}"
+
+    translated = re.sub(r"arguments\[(\d+)\]", replace_argument, script)
+    return translated, max_index
 
 
 @dataclass
@@ -221,8 +230,14 @@ class _SwitchTo:
 class PlaywrightDriver:
     def __init__(self, initial_url: str | None = None, browser: str = "playwright", headless: bool = False):
         self._playwright = sync_playwright().start()
-        self._browser_type = browser.strip().lower()
-        channel = os.getenv("SITFA_PLAYWRIGHT_CHANNEL", "").strip() or None
+        self._browser_type = (browser or "chrome").strip().lower()
+        env_channel = os.getenv("SITFA_PLAYWRIGHT_CHANNEL", "").strip() or None
+        if self._browser_type in {"edge", "msedge"}:
+            channel = "msedge"
+        elif self._browser_type in {"chrome", "chromium", "playwright"}:
+            channel = env_channel or "chrome"
+        else:
+            channel = env_channel or "chrome"
         launch_args: dict[str, Any] = {"headless": headless}
         if channel:
             launch_args["channel"] = channel
@@ -232,13 +247,42 @@ class PlaywrightDriver:
             ignore_https_errors=True,
         )
         self._page = self._context.new_page()
+        self._context.on("page", self._configure_page)
+        self._configure_page(self._page)
         self._current_frame = None
         self.switch_to = _SwitchTo(self)
         self._page_load_timeout = int(os.getenv("SITFA_PAGE_LOAD_TIMEOUT", "20"))
         self._script_timeout = int(os.getenv("SITFA_SCRIPT_TIMEOUT", "8"))
         self._page_load_strategy = (os.getenv("SITFA_PAGE_LOAD_STRATEGY", "eager") or "eager").strip().lower()
+        self._apply_default_timeouts()
         if initial_url:
             self.get(initial_url)
+
+    def _configure_page(self, page) -> None:
+        try:
+            def _auto_accept_dialog(dialog) -> None:
+                try:
+                    dialog.accept()
+                except Exception:
+                    # Some dialogs are already handled by Playwright internally.
+                    # Ignore those cases so the automation keeps moving.
+                    pass
+
+            page.on("dialog", _auto_accept_dialog)
+        except Exception:
+            pass
+
+    def _apply_default_timeouts(self) -> None:
+        timeout_ms = self._action_timeout_ms()
+        navigation_timeout_ms = max(1, int(self._page_load_timeout * 1000))
+        try:
+            self._page.set_default_timeout(timeout_ms)
+        except Exception:
+            pass
+        try:
+            self._page.set_default_navigation_timeout(navigation_timeout_ms)
+        except Exception:
+            pass
 
     def _action_timeout_ms(self) -> int:
         return max(1, int(self._script_timeout * 1000))
@@ -310,30 +354,45 @@ class PlaywrightDriver:
 
     def set_page_load_timeout(self, timeout: int) -> None:
         self._page_load_timeout = timeout
+        self._apply_default_timeouts()
 
     def set_script_timeout(self, timeout: int) -> None:
         self._script_timeout = timeout
+        self._apply_default_timeouts()
 
     def execute_script(self, script: str, *args: Any) -> Any:
-        translated = _translate_script(script)
+        translated, max_index = _translate_script(script)
         if "window.open(arguments[0]" in script:
             url = str(args[0]) if args else ""
-            new_page = self._context.new_page()
+            base_url = ""
             try:
-                new_page.goto(url, wait_until=self._wait_until())
+                base_url = self._page.url or ""
+            except Exception:
+                base_url = ""
+            target_url = urljoin(base_url or "about:blank", url)
+            new_page = self._context.new_page()
+            self._configure_page(new_page)
+            try:
+                new_page.goto(target_url, wait_until=self._wait_until())
             except Exception:
                 pass
             return None
         if "window.setTimeout(function() { window.location.href = targetUrl; }, 0);" in script:
             url = str(args[0]) if args else ""
-            self._page.goto(url, wait_until=self._wait_until())
+            base_url = ""
+            try:
+                base_url = self._page.url or ""
+            except Exception:
+                base_url = ""
+            self._page.goto(urljoin(base_url or "about:blank", url), wait_until=self._wait_until())
             self._current_frame = None
             return True
 
         context = self._current_context()
         js_args = list(args)
+        arg_bindings = "\n".join(f"const arg{i} = args[{i}];" for i in range(max_index + 1)) if max_index >= 0 else ""
         try:
-            return context.evaluate(f"(args) => {{ const arg0 = args[0]; const arg1 = args[1]; {translated} }}", js_args)
+            return context.evaluate(f"(args) => {{\n{arg_bindings}\n{translated}\n}}", js_args)
         except PlaywrightTimeoutError as exc:
             raise TimeoutException(str(exc)) from exc
         except Exception as exc:
@@ -368,9 +427,48 @@ class PlaywrightDriver:
 
     def close(self) -> None:
         try:
+            current_handle = self.current_window_handle
             self._page.close()
         except Exception:
             pass
+        remaining_pages = [page for page in self._context.pages if self._handle_for_page(page) != current_handle]
+        if remaining_pages:
+            self._page = remaining_pages[0]
+        self._current_frame = None
+
+    def refresh(self) -> None:
+        try:
+            self._page.reload(wait_until=self._wait_until())
+        except Exception as exc:
+            raise WebDriverException(str(exc)) from exc
+
+    def back(self) -> None:
+        try:
+            self._page.go_back(wait_until=self._wait_until())
+        except Exception as exc:
+            raise WebDriverException(str(exc)) from exc
+
+    def forward(self) -> None:
+        try:
+            self._page.go_forward(wait_until=self._wait_until())
+        except Exception as exc:
+            raise WebDriverException(str(exc)) from exc
+
+    def set_window_size(self, width: int, height: int) -> None:
+        try:
+            self._page.set_viewport_size({"width": width, "height": height})
+        except Exception as exc:
+            raise WebDriverException(str(exc)) from exc
+
+    def maximize_window(self) -> None:
+        self.set_window_size(1920, 1080)
+
+    def implicitly_wait(self, timeout: float) -> None:
+        # Playwright waits are explicit; keep the method for Selenium-shaped compatibility.
+        try:
+            self._page.set_default_timeout(max(1, int(timeout * 1000)))
+        except Exception as exc:
+            raise WebDriverException(str(exc)) from exc
 
     def _switch_to_window(self, handle: str) -> None:
         page = self._page_for_handle(handle)
