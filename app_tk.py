@@ -56,10 +56,11 @@ class BackendWorker:
                         driver = None
 
                     mode = "no visible" if payload.get("headless") else "visible"
-                    self._log(f"Creando driver en modo {mode} con Edge")
+                    browser = (payload.get("browser") or "chrome").strip().lower()
+                    self._log(f"Creando driver en modo {mode} con {browser.upper()}")
                     driver = create_driver(
                         initial_url=LOGIN_URL,
-                        browser="edge",
+                        browser=browser,
                         headless=bool(payload.get("headless")),
                     )
                     login_to_sitfa(driver, payload["username"], payload["password"], log_callback=self._log)
@@ -110,6 +111,7 @@ class SitfaApp(tk.Tk):
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
         self.headless_var = tk.BooleanVar(value=True)
+        self.browser_var = tk.StringVar(value="chrome")
         self.rit_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ingrese sus credenciales para iniciar sesion.")
         self.session_var = tk.StringVar(value="Sin sesion iniciada")
@@ -155,15 +157,25 @@ class SitfaApp(tk.Tk):
         ttk.Label(card, text="Clave").grid(row=2, column=0, sticky="w", pady=6)
         ttk.Entry(card, textvariable=self.password_var, show="*", width=34).grid(row=2, column=1, sticky="ew", pady=6)
 
-        ttk.Checkbutton(card, text="Modo no visible (Edge headless)", variable=self.headless_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(10, 16)
+        ttk.Label(card, text="Navegador").grid(row=3, column=0, sticky="w", pady=(10, 6))
+        browser_selector = ttk.Combobox(
+            card,
+            textvariable=self.browser_var,
+            values=("chrome", "edge"),
+            state="readonly",
+            width=31,
+        )
+        browser_selector.grid(row=3, column=1, sticky="ew", pady=(10, 6))
+
+        ttk.Checkbutton(card, text="Modo no visible", variable=self.headless_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(10, 16)
         )
 
         self.login_button = ttk.Button(card, text="Ingresar", command=self._on_login)
-        self.login_button.grid(row=4, column=0, columnspan=2, sticky="ew")
+        self.login_button.grid(row=5, column=0, columnspan=2, sticky="ew")
 
         ttk.Label(card, textvariable=self.status_var, foreground="#334155", wraplength=420).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(16, 0)
+            row=6, column=0, columnspan=2, sticky="w", pady=(16, 0)
         )
         card.columnconfigure(1, weight=1)
 
@@ -581,6 +593,7 @@ class SitfaApp(tk.Tk):
                 "username": username,
                 "password": password,
                 "headless": self.headless_var.get(),
+                "browser": self.browser_var.get().strip().lower(),
             },
         )
 

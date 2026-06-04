@@ -21,6 +21,8 @@ import fitz
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.ie.service import Service as IeService
@@ -688,6 +690,18 @@ def find_edge_path() -> str | None:
     return None
 
 
+def find_chrome_path() -> str | None:
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def read_credentials() -> tuple[str, str]:
     username = os.getenv("SITFA_USER") or input("Usuario SITFA: ").strip()
     password = os.getenv("SITFA_PASS")
@@ -739,7 +753,7 @@ def parse_runtime_options() -> tuple[str, bool, bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--browser",
-        choices=("ie", "edge"),
+        choices=("ie", "edge", "chrome"),
         default=None,
         help="Browser mode to use. Defaults to Edge.",
     )
@@ -780,7 +794,22 @@ def create_driver(initial_url: str | None = None, browser: str = "edge", headles
     browser = (browser or "edge").strip().lower()
     page_load_strategy = os.getenv("SITFA_PAGE_LOAD_STRATEGY", "eager")
 
-    if browser == "edge":
+    if browser == "chrome":
+        options = ChromeOptions()
+        options.page_load_strategy = page_load_strategy
+        chrome_path = os.getenv("SITFA_CHROME_PATH") or find_chrome_path()
+        if chrome_path:
+            options.binary_location = chrome_path
+        if headless:
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument("--window-size=1600,1200")
+
+        driver_path = os.getenv("CHROMEDRIVER_PATH") or os.getenv("CHROMEWEBDRIVER_PATH")
+        service = ChromeService(executable_path=driver_path) if driver_path else ChromeService()
+        driver = webdriver.Chrome(service=service, options=options)
+    elif browser == "edge":
         options = EdgeOptions()
         options.page_load_strategy = page_load_strategy
         if headless:
