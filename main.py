@@ -12,7 +12,7 @@ import uuid
 import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import parse_qs, urljoin, urlencode, urlparse
 from urllib.request import Request, urlopen
 import unicodedata
