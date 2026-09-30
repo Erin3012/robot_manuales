@@ -23,6 +23,7 @@ from main import (
     create_driver,
     download_pdf_with_session,
     login_to_sitfa,
+    normalize_header_name,
     normalize_litigantes_value,
     open_cartola_bco_estado_popup_from_litigantes,
     resolve_litigantes_popup_url,
@@ -303,6 +304,8 @@ class SitfaApp(tk.Tk):
         self._pdf_tab_counters: dict[str, int] = {}
         self._current_pdf_tab_id: str = ""
         self._pdf_home_tab_id: str = ""
+        self._content_panedwindow = None
+        self._apply_initial_split = None
 
         self._build_login_frame()
         self._build_case_frame()
@@ -386,6 +389,7 @@ class SitfaApp(tk.Tk):
 
         content = ttk.Panedwindow(self.case_frame, orient="horizontal")
         content.pack(fill="both", expand=True)
+        self._content_panedwindow = content
 
         left_panel = ttk.Frame(content)
         left_panel.columnconfigure(0, weight=1)
@@ -394,12 +398,17 @@ class SitfaApp(tk.Tk):
         notebook = ttk.Notebook(left_panel)
         notebook.grid(row=0, column=0, sticky="nsew")
 
-        self.pending_tree = self._build_tree_tab(notebook, "Pendientes", ("RIT", "Detalle", "Tribunal"), ("RIT", "Detalle", "Tribunal"))
+        self.pending_tree = self._build_tree_tab(
+            notebook,
+            "Pendientes",
+            ("RIT", "FECHA TRÁMITE", "REFERENCIA"),
+            ("RIT", "fecha_tramite", "referencia"),
+        )
         self.history_tree = self._build_tree_tab(
             notebook,
             "Historia",
-            ("Fecha", "Tip. Ing.", "Referencia"),
-            ("fecha", "tip_ing", "referencia"),
+            ("Fecha", "Folio", "Tip. Ing.", "Referencia"),
+            ("fecha", "folio", "tip_ing", "referencia"),
         )
         self.liquidacion_tree = self._build_tree_tab(notebook, "Liquidacion", ("Fecha", "Referencia"), ("fecha", "referencia"))
         self.escritos_tree = self._build_tree_tab(notebook, "Esc. por Resolv.", ("Fecha", "Referencia"), ("fecha", "referencia"))
@@ -418,8 +427,8 @@ class SitfaApp(tk.Tk):
         self.detail_tree = self._build_tree_tab(
             notebook,
             "Historia RIT",
-            ("Fecha", "Tip. Ing.", "Referencia"),
-            ("fecha", "tip_ing", "referencia"),
+            ("Fecha", "Folio", "Tip. Ing.", "Referencia"),
+            ("fecha", "folio", "tip_ing", "referencia"),
         )
         self.cartola_tree = self._build_tree_tab(
             notebook,
@@ -486,14 +495,14 @@ class SitfaApp(tk.Tk):
         def _set_initial_split() -> None:
             if not self.winfo_exists():
                 return
-            width = self.case_frame.winfo_width()
-            if width <= 1:
-                width = self.winfo_width()
-            if width <= 1:
+            if not self.case_frame.winfo_ismapped() or content.winfo_width() <= 1:
                 self.after(80, _set_initial_split)
                 return
-            content.sashpos(0, max(520, min(int(width * 0.60), width - 420)))
+            width = content.winfo_width()
+            left_width = max(520, min(int(width * 0.60), width - 420))
+            content.sashpos(0, left_width)
 
+        self._apply_initial_split = _set_initial_split
         self.after(120, _set_initial_split)
 
         footer = ttk.Frame(self.case_frame)
@@ -1017,9 +1026,42 @@ class SitfaApp(tk.Tk):
 
     def _fill_section(self, section: str, rows: list[dict]) -> None:
         if section == "pending":
-            self._fill_tree(self.pending_tree, rows, ("RIT", "Tribunal", "Materia"), section)
+            display_rows = []
+            for row in rows:
+                display_row = dict(row)
+                normalized_values = {
+                    normalize_header_name(str(key)): str(value or "").strip()
+                    for key, value in row.items()
+                }
+
+                display_row["RIT"] = str(row.get("RIT") or "").strip()
+                display_row["fecha_tramite"] = str(row.get("fecha_tramite") or "").strip() or next(
+                    (
+                        normalized_values[normalize_header_name(alias)]
+                        for alias in (
+                            "Fecha trámite",
+                            "Fec. trámite",
+                            "Fecha de trámite",
+                            "Fecha",
+                            "Fec. Ing.",
+                        )
+                        if normalized_values.get(normalize_header_name(alias))
+                    ),
+                    "",
+                )
+                display_row["referencia"] = str(row.get("referencia") or "").strip() or next(
+                    (
+                        normalized_values[normalize_header_name(alias)]
+                        for alias in ("Referencia", "Ref.", "Descripción", "Trámite")
+                        if normalized_values.get(normalize_header_name(alias))
+                    ),
+                    "",
+                )
+                display_rows.append(display_row)
+
+            self._fill_tree(self.pending_tree, display_rows, ("RIT", "fecha_tramite", "referencia"), section)
         elif section == "historia":
-            self._fill_tree(self.history_tree, rows, ("fecha", "tip_ing", "referencia"), section)
+            self._fill_tree(self.history_tree, rows, ("fecha", "folio", "tip_ing", "referencia"), section)
         elif section == "liquidacion":
             self._fill_tree(self.liquidacion_tree, rows, ("fecha", "referencia"), section)
         elif section == "escritos":
@@ -1039,7 +1081,7 @@ class SitfaApp(tk.Tk):
                 section,
             )
         elif section == "detail_history":
-            self._fill_tree(self.detail_tree, rows, ("fecha", "tip_ing", "referencia"), section)
+            self._fill_tree(self.detail_tree, rows, ("fecha", "folio", "tip_ing", "referencia"), section)
         elif section == "cartola":
             self._fill_tree(self.cartola_tree, rows, ("Fecha", "Tipo movimiento", "Monto"), section)
 
@@ -1072,6 +1114,8 @@ class SitfaApp(tk.Tk):
         if event == "login_success":
             self.login_frame.pack_forget()
             self.case_frame.pack(fill="both", expand=True)
+            if self._apply_initial_split is not None:
+                self.after_idle(self._apply_initial_split)
             self.session_var.set(f"Sesion iniciada: {self.username_var.get().strip()}")
             self.status_var.set("Sesion iniciada. Ingrese un RIT para consultar.")
             self._set_busy(False, self.status_var.get())

@@ -1414,12 +1414,14 @@ def collect_history_rows(driver) -> list[dict]:
         header_lookup = {str(header).strip().lower(): index for index, header in enumerate(headers)}
         fecha_index = header_lookup.get("fecha")
         referencia_index = header_lookup.get("referencia")
+        folio_index = None
         tipo_ingreso_index = None
         for header, index in header_lookup.items():
             compact_header = re.sub(r"[^a-z0-9]", "", header)
-            if compact_header in {"tiping", "tipoing", "tipoingreso", "tipingreso"}:
+            if compact_header in {"folio", "nfolio", "numerofolio"}:
+                folio_index = index
+            elif compact_header in {"tiping", "tipoing", "tipoingreso", "tipingreso"}:
                 tipo_ingreso_index = index
-                break
         if fecha_index is None or referencia_index is None:
             continue
 
@@ -1427,9 +1429,11 @@ def collect_history_rows(driver) -> list[dict]:
         for row_index, row in enumerate(rows, start=1):
             cells = row.get("cells") or []
             fecha = cells[fecha_index] if fecha_index < len(cells) else ""
+            folio = cells[folio_index] if folio_index is not None and folio_index < len(cells) else ""
             referencia = cells[referencia_index] if referencia_index < len(cells) else ""
             tipo_ingreso = cells[tipo_ingreso_index] if tipo_ingreso_index is not None and tipo_ingreso_index < len(cells) else ""
             fecha = " ".join(str(fecha).split())
+            folio = " ".join(str(folio).split())
             referencia = " ".join(str(referencia).split())
             tipo_ingreso = " ".join(str(tipo_ingreso).split())
             pdf_url = row.get("pdf_url") or ""
@@ -1438,6 +1442,7 @@ def collect_history_rows(driver) -> list[dict]:
                     {
                         "index": row_index,
                         "fecha": fecha,
+                        "folio": folio,
                         "tip_ing": tipo_ingreso,
                         "referencia": referencia,
                         "pdf_url": pdf_url,
@@ -3405,6 +3410,39 @@ def extract_pending_case_rows_from_html(source: str) -> list[dict]:
                 if key and normalize_header_name(key) not in hidden_headers
             }
             normalized_row["RIT"] = rit_value
+
+            # SITFA cambia levemente los nombres de estas columnas entre
+            # listados. Dejamos tambien nombres canonicos para la interfaz.
+            normalized_by_header = {
+                normalize_header_name(key): value for key, value in extracted.items()
+            }
+            normalized_row["fecha_tramite"] = next(
+                (
+                    normalized_by_header[normalize_header_name(alias)]
+                    for alias in (
+                        "Fecha trámite",
+                        "Fec. trámite",
+                        "Fecha de trámite",
+                        "Fecha",
+                        "Fec. Ing.",
+                    )
+                    if normalized_by_header.get(normalize_header_name(alias))
+                ),
+                "",
+            )
+            normalized_row["referencia"] = next(
+                (
+                    normalized_by_header[normalize_header_name(alias)]
+                    for alias in (
+                        "Referencia",
+                        "Ref.",
+                        "Descripción",
+                        "Trámite",
+                    )
+                    if normalized_by_header.get(normalize_header_name(alias))
+                ),
+                "",
+            )
             if rit_header_name and rit_header_name != "RIT":
                 normalized_row.setdefault(rit_header_name, rit_value)
             candidate_rows.append(normalized_row)
