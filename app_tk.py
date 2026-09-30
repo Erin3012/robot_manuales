@@ -1220,6 +1220,12 @@ class SitfaApp(tk.Tk):
             section = "liquidacion"
         elif tree is self.escritos_tree:
             section = "escritos"
+        elif tree is self.litigantes_tree:
+            section = "litigantes"
+        elif tree is self.cons_lit_tree:
+            section = "cons_lit"
+        elif tree is self.detail_tree:
+            section = "detail_history"
         else:
             return None
 
@@ -1248,7 +1254,26 @@ class SitfaApp(tk.Tk):
                 self.rit_var.set(rit)
                 self._on_consult()
             return
-        if tree not in (self.history_tree, self.liquidacion_tree, self.escritos_tree):
+
+        if tree is self.litigantes_tree:
+            # El doble clic equivale al botón "Seleccionar litigante".
+            self._on_select_litigante()
+            return
+
+        if tree is self.cons_lit_tree:
+            # El doble clic equivale al botón "Historia RIT".
+            selection = tree.selection()
+            if not selection:
+                return
+            row = self._get_row_for_tree_item(tree, selection[0])
+            rit = str((row or {}).get("RIT") or "").strip().upper()
+            if rit:
+                self.rit_var.set(rit)
+                self.detail_rit_var.set(rit)
+                self._on_history_detail()
+            return
+
+        if tree not in (self.history_tree, self.detail_tree, self.liquidacion_tree, self.escritos_tree):
             return
 
         selection = tree.selection()
@@ -1266,6 +1291,8 @@ class SitfaApp(tk.Tk):
 
         if tree is self.history_tree:
             prefix = "historia"
+        elif tree is self.detail_tree:
+            prefix = "historia_rit"
         elif tree is self.liquidacion_tree:
             prefix = "liquidacion"
         else:
