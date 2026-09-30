@@ -16,6 +16,8 @@ This repo is a small automation project for the SITFA judicial system.
 - `app_tk.py`: Desktop UI variant with browser selector and local PDF preview.
 - `pdf_viewer.py`: Local PDF viewer used by the automation flow.
 - `browser_compat.py`: Playwright-based compatibility layer that mirrors Selenium-like APIs.
+- `actualizador.py` and `updater_helper.py`: Mandatory GitHub release updater and Windows self-replacement helper for the packaged desktop EXE.
+- `crear_exe.py`: PyInstaller build script for `Robot_Manuales_vN.exe` plus `updater_helper.exe`.
 - Litigant selections now preserve the original row `onclick` so Cartola Banco Estado can reuse the real popup parameters instead of guessing them from the visible row text.
 - The Playwright wrapper now rewrites any `arguments[n]` placeholder it sees in a script, which matters for cartola filters and similar multi-argument `execute_script` calls.
 
@@ -39,6 +41,7 @@ This repo is a small automation project for the SITFA judicial system.
 - The code expects Playwright plus a Chrome/Chromium browser install available locally.
 - Cartola Banco Estado is sensitive to the litigant row metadata; when debugging empty account lists, verify that the selected litigant carries the original `onclick` from the SITFA table.
 - If a Playwright `Page.evaluate` error mentions `arguments is not defined`, check whether the script was using more than two positional arguments and needs to be translated by `browser_compat.py`.
+- Releases use numeric tags such as `v1`, `v2`, and publish the exact asset `Robot_Manuales_vN.exe` plus `updater_helper.exe`.
 
 ## What to tell the AI in a new chat
 - Start from this file instead of re-reading the whole repo.

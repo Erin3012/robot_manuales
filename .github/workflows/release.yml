@@ -1,0 +1,43 @@
+name: Crear release de Robot Manuales
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        shell: pwsh
+        run: python -m pip install --upgrade pip; pip install -r requirements.txt
+
+      - name: Definir versión desde el tag
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($version -notmatch '^\d+$') { throw "El tag debe tener formato vN" }
+          "ROBOT_MANUALES_RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Compilar ejecutables
+        run: python crear_exe.py
+
+      - name: Publicar GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/Robot_Manuales_v${{ env.ROBOT_MANUALES_RELEASE_VERSION }}.exe
+            dist/updater_helper.exe

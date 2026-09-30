@@ -13,7 +13,7 @@ import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urljoin, urlencode
+from urllib.parse import parse_qs, urljoin, urlencode, urlparse
 from urllib.request import Request, urlopen
 import unicodedata
 
@@ -24,6 +24,7 @@ from browser_compat import By, NoSuchElementException, PlaywrightDriver, Timeout
 LOGIN_URL = "http://www.familia.pjud/SITFAWEB/jsp/Login/Login.jsp"
 POST_LOGIN_URL = "http://www.familia.pjud/SITFAWEB/MenuLinkAction.do?opMenu=ConsultaRolTramitar&opRol=59"
 PENDING_CASES_URL = "http://www.familia.pjud/SITFAWEB/TrmPendientesViewAccion.do?TipoTramite=2"
+PENDING_TRAMITES_URL = "http://www.familia.pjud/SITFAWEB/TrmPendientesViewAccion.do?TipoTramite=1"
 PDF_VIEWER_HOST = "127.0.0.1"
 PDF_VIEWER_PORT = 54877
 PDF_VIEWER_SCRIPT = Path(__file__).with_name("pdf_viewer.py")
@@ -1413,6 +1414,12 @@ def collect_history_rows(driver) -> list[dict]:
         header_lookup = {str(header).strip().lower(): index for index, header in enumerate(headers)}
         fecha_index = header_lookup.get("fecha")
         referencia_index = header_lookup.get("referencia")
+        tipo_ingreso_index = None
+        for header, index in header_lookup.items():
+            compact_header = re.sub(r"[^a-z0-9]", "", header)
+            if compact_header in {"tiping", "tipoing", "tipoingreso", "tipingreso"}:
+                tipo_ingreso_index = index
+                break
         if fecha_index is None or referencia_index is None:
             continue
 
@@ -1421,14 +1428,17 @@ def collect_history_rows(driver) -> list[dict]:
             cells = row.get("cells") or []
             fecha = cells[fecha_index] if fecha_index < len(cells) else ""
             referencia = cells[referencia_index] if referencia_index < len(cells) else ""
+            tipo_ingreso = cells[tipo_ingreso_index] if tipo_ingreso_index is not None and tipo_ingreso_index < len(cells) else ""
             fecha = " ".join(str(fecha).split())
             referencia = " ".join(str(referencia).split())
+            tipo_ingreso = " ".join(str(tipo_ingreso).split())
             pdf_url = row.get("pdf_url") or ""
             if fecha or referencia:
                 history_rows.append(
                     {
                         "index": row_index,
                         "fecha": fecha,
+                        "tip_ing": tipo_ingreso,
                         "referencia": referencia,
                         "pdf_url": pdf_url,
                     }
@@ -1436,6 +1446,65 @@ def collect_history_rows(driver) -> list[dict]:
         return history_rows
 
     return []
+
+
+def collect_tramites_pendientes_rows(driver) -> list[dict]:
+    """Extrae la pestaña Trámites Pend. de la causa actualmente consultada."""
+    try:
+        driver.execute_script(
+            """
+            var tab = document.getElementById('tdTp');
+            if (tab && typeof tab.click === 'function') {
+                tab.click();
+            }
+            """
+        )
+        time.sleep(0.3)
+        rows = driver.execute_script(
+            """
+            function clean(value) {
+                return String(value || '').replace(/\\s+/g, ' ').trim();
+            }
+            var root = document.getElementById('divtp');
+            if (!root) {
+                return [];
+            }
+            var table = root.querySelector('table');
+            if (!table) {
+                return [];
+            }
+            var result = [];
+            Array.from(table.querySelectorAll('tbody tr')).forEach(function(row) {
+                var cells = Array.from(row.children).filter(function(node) {
+                    return ['TD', 'TH'].indexOf(node.tagName) >= 0;
+                }).map(function(node) { return clean(node.innerText || node.textContent); });
+                if (!cells.some(Boolean)) {
+                    return;
+                }
+                // SITFA puede devolver la fila de encabezados dentro de tbody
+                // y además variar la codificación de "Trámite". Usamos la
+                // posición estable de las columnas de esta tabla.
+                if (cells.length < 7 || cells[1] === 'Fecha') {
+                    return;
+                }
+                var item = {
+                    'Fecha': cells[1] || '',
+                    'Referencia': cells[2] || '',
+                    'Etapa': cells[3] || '',
+                    'Trámite': cells[4] || '',
+                    'Estado': cells[5] || '',
+                    'Usuario': cells[6] || ''
+                };
+                if (item['Fecha'] || item['Referencia'] || item['Trámite']) {
+                    result.push(item);
+                }
+            });
+            return result;
+            """
+        ) or []
+        return rows if isinstance(rows, list) else []
+    except WebDriverException:
+        return []
 
 
 def print_history_tab(driver) -> list[dict]:
@@ -2067,6 +2136,16 @@ def consult_case(
     emit_progress("Historia cargada", 52)
 
     step_start = time.perf_counter()
+    tramites_pendientes = collect_tramites_pendientes_rows(driver)
+    emit_log(
+        log_callback,
+        f"Trámites pendientes de la causa: {len(tramites_pendientes)} filas en "
+        f"{time.perf_counter() - step_start:.1f}s",
+    )
+    if section_callback is not None:
+        section_callback("tramites_pendientes", tramites_pendientes)
+
+    step_start = time.perf_counter()
     liquidacion = collect_liquidacion_rows(driver)
     emit_log(log_callback, f"Liquidación: {len(liquidacion)} filas en {time.perf_counter() - step_start:.1f}s")
     if section_callback is not None:
@@ -2093,6 +2172,7 @@ def consult_case(
     emit_progress("Consulta terminada", 100)
     return {
         "historia": historia,
+        "tramites_pendientes": tramites_pendientes,
         "liquidacion": liquidacion,
         "escritos": escritos,
         "litigantes": litigantes,
@@ -3337,7 +3417,7 @@ def extract_pending_case_rows_from_html(source: str) -> list[dict]:
     return best_rows
 
 
-def click_pending_cases_all_and_submit(driver) -> None:
+def click_pending_cases_all_and_submit(driver, submit_label: str = "Cons.Actuaciones") -> None:
     driver.switch_to.default_content()
     driver.execute_script(
         """
@@ -3370,12 +3450,15 @@ def click_pending_cases_all_and_submit(driver) -> None:
             throw new Error("No se pudo marcar la opcion Todas");
         }
 
-        var submitButton = form.querySelector('input[type="submit"][value="Cons.Actuaciones"]');
+        var submitLabel = String(arguments[0] || "Cons.Actuaciones");
+        var submitButton = Array.from(form.querySelectorAll('input[type="submit"]')).find(function(button) {
+            return String(button.value || "").trim() === submitLabel;
+        });
         if (!submitButton) {
             submitButton = form.querySelector('input[name="irAccionTramitarT"]');
         }
         if (!submitButton) {
-            throw new Error("No se encontro el boton Cons.Actuaciones");
+            throw new Error("No se encontro el boton " + submitLabel);
         }
 
         if (typeof submitButton.click === "function") {
@@ -3383,7 +3466,8 @@ def click_pending_cases_all_and_submit(driver) -> None:
         } else {
             submitButton.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
         }
-        """
+        """,
+        submit_label,
     )
     wait_for_ready(driver, timeout=30)
 
@@ -3418,6 +3502,38 @@ def collect_pending_case_rows(driver, log_callback: LogCallback | None = None) -
         log_callback,
         f"Pendientes: {len(last_rows)} filas cargadas en {time.perf_counter() - total_start:.1f}s "
         f"(url={last_url or PENDING_CASES_URL})",
+    )
+    return last_rows
+
+
+def collect_pending_tramite_rows(driver, log_callback: LogCallback | None = None) -> list[dict]:
+    total_start = time.perf_counter()
+    emit_log(log_callback, "Trámites pendientes: abriendo listado")
+    driver.get(PENDING_TRAMITES_URL)
+    wait_for_ready(driver, timeout=30)
+    emit_log(log_callback, "Trámites pendientes: seleccionando Todos y consultando")
+    click_pending_cases_all_and_submit(driver, submit_label="Cons.Trámites")
+
+    deadline = time.time() + float(os.getenv("SITFA_WINDOW_WAIT", "8"))
+    last_rows: list[dict] = []
+    last_url = ""
+    while time.time() < deadline:
+        scope_results = inspect_window_scopes(driver)
+        last_url = driver.current_url
+        best_rows: list[dict] = []
+        for scope in scope_results:
+            scope_rows = extract_pending_case_rows_from_html(scope.get("html") or "")
+            if len(scope_rows) > len(best_rows):
+                best_rows = scope_rows
+        last_rows = best_rows
+        if last_rows:
+            break
+        time.sleep(0.4)
+
+    emit_log(
+        log_callback,
+        f"Trámites pendientes: {len(last_rows)} filas cargadas en {time.perf_counter() - total_start:.1f}s "
+        f"(url={last_url or PENDING_TRAMITES_URL})",
     )
     return last_rows
 
@@ -3539,6 +3655,17 @@ def _open_litigantes_action_popup_from_litigantes(
     target_row_data: dict[str, str] | None = None,
     action_log_prefix: str = "Litigantes action",
 ) -> tuple[str | None, str]:
+    cause_id_value = ""
+    for candidate_url in (litigantes_popup_url, getattr(driver, "current_url", "")):
+        try:
+            cause_id_value = (parse_qs(urlparse(str(candidate_url)).query).get("CRR_IdCausa") or [""])[0].strip()
+        except Exception:
+            cause_id_value = ""
+        if cause_id_value:
+            break
+    if not cause_id_value:
+        cause_id_value = "0"
+
     original_handle = ""
     opened_temp_handle = ""
     try:
@@ -3750,11 +3877,15 @@ def _open_litigantes_action_popup_from_litigantes(
                     id_parte_value = onclick_args[2].strip()
                     popup_url = (
                         "/SITFAWEB/jsp/Tramitacion/PopUp/PopUpPpal.jsp?"
-                        f"TIP_Consulta=0&CRR_IdCausa=13467118&CRR_IdTramite=0&CRR_IdNomenclatura=0"
+                        f"TIP_Consulta=0&CRR_IdCausa={cause_id_value}&CRR_IdTramite=0&CRR_IdNomenclatura=0"
                         f"&CRR_IdParte={id_parte_value}&tipo_popUp=47&RUT_Litigante={rut_value}&RUT_DV={dv_value}"
                     )
-                    emit_log(log_callback, f"{action_log_prefix}: url derivada directa -> {popup_url}")
-                    return popup_url, ""
+                    # No se retorna todavía. Primero se intenta el clic real
+                    # sobre la acción de SITFA, porque ese flujo conserva todos
+                    # los parámetros adicionales que el servidor puede exigir.
+                    # Esta URL queda como respaldo si SITFA no permite capturar
+                    # la URL generada por la acción.
+                    emit_log(log_callback, f"{action_log_prefix}: URL de respaldo derivada desde onclick -> {popup_url}")
                 emit_log(
                     log_callback,
                     f"{action_log_prefix}: onclick insuficiente para cartola: {onclick_args[:8]}",
@@ -3927,14 +4058,14 @@ def _open_litigantes_action_popup_from_litigantes(
                     if action_target == "CONS. LIT.":
                         popup_url = (
                             "/SITFAWEB/jsp/Ingreso/PopUp/PopUpPpalB4.jsp?"
-                            f"COD_Litigante={cod_litigante_value}&CRR_IdCausa=13467118&CRR_IdParte={id_parte_value}"
+                            f"COD_Litigante={cod_litigante_value}&CRR_IdCausa={cause_id_value}&CRR_IdParte={id_parte_value}"
                             f"&COD_Modulo=2&tipo_popUp=21&RUT_Litigante={rut_value}&RUT_DV={dv_value}"
                             f"&TIP_Identificacion={tip_ident_value}&IDF_Extranjero={idf_extranjero_value}&formaInicio=1&HeightIfrmae=600"
                         )
                     elif action_target == "CARTOLA BCO.ESTADO":
                         popup_url = (
                             "/SITFAWEB/jsp/Tramitacion/PopUp/PopUpPpal.jsp?"
-                            f"TIP_Consulta=0&CRR_IdCausa=13467118&CRR_IdTramite=0&CRR_IdNomenclatura=0&CRR_IdParte={id_parte_value}"
+                            f"TIP_Consulta=0&CRR_IdCausa={cause_id_value}&CRR_IdTramite=0&CRR_IdNomenclatura=0&CRR_IdParte={id_parte_value}"
                             f"&tipo_popUp=47&RUT_Litigante={rut_value}&RUT_DV={dv_value}"
                         )
                     emit_log(
@@ -3952,6 +4083,7 @@ def _open_litigantes_action_popup_from_litigantes(
                     driver.execute_script(
                         """
                         var actionTarget = String(arguments[0] || '').trim().toUpperCase();
+                        var causeId = String(arguments[1] || '').trim();
                         var rutValue = String(window.rut || '').trim();
                         var dvValue = String(window.dv || '').trim();
                         var identValue = String(window.TIP_Ident || '0').trim();
@@ -3961,17 +4093,18 @@ def _open_litigantes_action_popup_from_litigantes(
                         var base = '';
                         if (actionTarget === 'CONS. LIT.') {
                             base = '/SITFAWEB/jsp/Ingreso/PopUp/PopUpPpalB4.jsp?COD_Litigante=' + litiganteValue
-                                + '&CRR_IdCausa=13467118&CRR_IdParte=' + parteValue
+                                + '&CRR_IdCausa=' + causeId + '&CRR_IdParte=' + parteValue
                                 + '&COD_Modulo=2&tipo_popUp=21&RUT_Litigante=' + rutValue
                                 + '&RUT_DV=' + dvValue + '&TIP_Identificacion=' + identValue
                                 + '&IDF_Extranjero=' + pasaporteValue + '&formaInicio=1&HeightIfrmae=600';
                         } else if (actionTarget === 'CARTOLA BCO.ESTADO') {
-                            base = '/SITFAWEB/jsp/Tramitacion/PopUp/PopUpPpal.jsp?TIP_Consulta=0&CRR_IdCausa=13467118&CRR_IdTramite=0&CRR_IdNomenclatura=0&CRR_IdParte=' + parteValue
+                            base = '/SITFAWEB/jsp/Tramitacion/PopUp/PopUpPpal.jsp?TIP_Consulta=0&CRR_IdCausa=' + causeId + '&CRR_IdTramite=0&CRR_IdNomenclatura=0&CRR_IdParte=' + parteValue
                                 + '&tipo_popUp=47&RUT_Litigante=' + rutValue + '&RUT_DV=' + dvValue;
                         }
                         return base;
                         """,
                         action_target,
+                        cause_id_value,
                     )
                 ).strip()
             except WebDriverException:

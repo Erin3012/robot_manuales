@@ -18,6 +18,8 @@
 - Chrome is now the default browser for CLI, web, and Tk entrypoints, while Edge remains an explicit Playwright channel override.
 - Cartola Banco Estado now depends on preserving the litigant row `onclick` so the popup can be built with the real RUT/parte/cuenta parameters.
 - The Playwright compatibility layer now translates arbitrary `arguments[n]` placeholders, not just the first two arguments, to avoid `Page.evaluate` reference errors in cartola and related flows.
+- The desktop EXE now checks `Erin3012/robot_manuales` for mandatory `vN` releases before starting, and uses `updater_helper.exe` to replace and restart itself.
+- `crear_exe.py` builds `Robot_Manuales_vN.exe` from `app_tk.py`; GitHub Actions publishes it with the helper when a `vN` tag is pushed.
 
 ## Open follow-ups
 - No formal test suite is visible in the repo yet.

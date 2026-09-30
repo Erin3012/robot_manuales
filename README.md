@@ -7,6 +7,19 @@ Automatizacion en Python para consultar y trabajar con el sistema SITFA, con una
 - App de escritorio: `python app_tk.py`
 - Web local: `python run_web.py`
 
+## Crear el EXE
+La aplicación de escritorio se empaqueta con PyInstaller:
+
+```powershell
+$env:ROBOT_MANUALES_RELEASE_VERSION="1"
+py crear_exe.py
+```
+
+El build genera `dist/Robot_Manuales_v1.exe` y `dist/updater_helper.exe`.
+El EXE consulta automáticamente la última release de GitHub al iniciar. Para
+publicar una versión, crea un tag con formato `vN` y GitHub Actions compilará
+los dos ejecutables y creará la release correspondiente.
+
 ## Contexto del proyecto
 Si vas a seguir trabajando en este repo, empieza por estos archivos:
 - [AI_CONTEXT.md](AI_CONTEXT.md)

@@ -3,3 +3,4 @@ Pillow
 PyMuPDF
 fastapi
 uvicorn
+PyInstaller
