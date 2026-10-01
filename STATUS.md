@@ -22,5 +22,6 @@
 - `crear_exe.py` builds `Robot_Manuales_vN.exe` from `app_tk.py`; GitHub Actions publishes it with the helper when a `vN` tag is pushed.
 
 ## Open follow-ups
-- No formal test suite is visible in the repo yet.
+- Local Chrome/Tk regressions are available in `tests/test_cons_lit.py`; run `py -m unittest discover -s tests -v`.
+- Cons. Lit. was reproduced empty for `Z-2248-2026`: scoped child lookups lost the parent index and JavaScript did not receive a DOM handle. Both are fixed, and a live retest returned 50 rows.
 - If the automation becomes more complex, consider splitting `main.py` into smaller modules.

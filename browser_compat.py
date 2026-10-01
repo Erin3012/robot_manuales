@@ -83,10 +83,12 @@ class _ElementLocator:
     driver: "PlaywrightDriver"
     selector: str
     index: int = 0
+    parent: "_ElementLocator | None" = None
 
     @property
     def locator(self):
-        return self.driver._current_context().locator(self.selector).nth(self.index)
+        context = self.parent.locator if self.parent is not None else self.driver._current_context()
+        return context.locator(self.selector).nth(self.index)
 
     def _handle(self):
         try:
@@ -146,7 +148,7 @@ class _ElementLocator:
 
     def find_element(self, by: str, value: str) -> "_ElementLocator":
         selector = _selector_for(by, value)
-        return _ElementLocator(self.driver, f"{self.selector} {selector}", 0)
+        return _ElementLocator(self.driver, selector, 0, parent=self)
 
     def find_elements(self, by: str, value: str) -> list["_ElementLocator"]:
         selector = _selector_for(by, value)
@@ -155,7 +157,7 @@ class _ElementLocator:
             count = locator.count()
         except PlaywrightTimeoutError as exc:
             raise TimeoutException(str(exc)) from exc
-        return [_ElementLocator(self.driver, f"{self.selector} {selector}", i) for i in range(count)]
+        return [_ElementLocator(self.driver, selector, i, parent=self) for i in range(count)]
 
     def submit(self) -> None:
         handle = self._handle()
@@ -389,7 +391,10 @@ class PlaywrightDriver:
             return True
 
         context = self._current_context()
-        js_args = list(args)
+        # Playwright solo reconoce ElementHandle como argumento DOM. Pasar
+        # nuestro wrapper directamente lo convierte en undefined y scripts
+        # como row.click() terminan sin seleccionar ningún litigante.
+        js_args = [arg._handle() if isinstance(arg, _ElementLocator) else arg for arg in args]
         arg_bindings = "\n".join(f"const arg{i} = args[{i}];" for i in range(max_index + 1)) if max_index >= 0 else ""
         try:
             return context.evaluate(f"(args) => {{\n{arg_bindings}\n{translated}\n}}", js_args)

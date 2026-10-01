@@ -295,6 +295,7 @@ class SitfaApp(tk.Tk):
         self.cartola_status_var = tk.StringVar(value="Cartola no abierta")
         self.cartola_account_combo = None
         self.detail_rit_var = tk.StringVar()
+        self.cons_lit_status_var = tk.StringVar(value="Consulta de causas del litigante demandado (DDO.).")
         self.pdf_notebook = None
         self.pdf_status_var = tk.StringVar(value="Sin PDF cargado")
         self.pdf_zoom_var = tk.DoubleVar(value=1.35)
@@ -424,6 +425,11 @@ class SitfaApp(tk.Tk):
             ("RIT", "Fec. Ing.", "Fec. Ult. tramite", "Tribunal", "Materia(Termino)"),
             ("RIT", "Fec. Ing.", "Fec. ?lt. tr?mite", "Tribunal", "Materia(T?rmino)"),
         )
+        ttk.Label(
+            self.cons_lit_tree.master,
+            textvariable=self.cons_lit_status_var,
+            wraplength=800,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.detail_tree = self._build_tree_tab(
             notebook,
             "Historia RIT",
@@ -1015,6 +1021,7 @@ class SitfaApp(tk.Tk):
             for item in tree.get_children():
                 tree.delete(item)
         self._section_rows.clear()
+        self.cons_lit_status_var.set("Consulta de causas del litigante demandado (DDO.).")
 
     def _fill_tree(self, tree: ttk.Treeview, rows: list[dict], keys: tuple[str, ...], section: str) -> None:
         for item in tree.get_children():
@@ -1080,6 +1087,15 @@ class SitfaApp(tk.Tk):
                 ("RIT", "Fec. Ing.", "Fec. Últ. trámite", "Tribunal", "Materia(Término)"),
                 section,
             )
+            if rows:
+                self.cons_lit_status_var.set(f"{len(rows)} causas del litigante demandado (DDO.).")
+            elif self._section_rows.get("litigantes") and not any(
+                normalize_header_name(str(row.get("Sujeto", ""))) == "ddo"
+                for row in self._section_rows["litigantes"]
+            ):
+                self.cons_lit_status_var.set("Esta causa no tiene litigante DDO.; no hay consulta automática de Cons. Lit.")
+            else:
+                self.cons_lit_status_var.set("Cons. Lit. no devolvió causas. Revisa la pestaña Logs para conocer el resultado.")
         elif section == "detail_history":
             self._fill_tree(self.detail_tree, rows, ("fecha", "folio", "tip_ing", "referencia"), section)
         elif section == "cartola":

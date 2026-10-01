@@ -26,6 +26,29 @@ Si vas a seguir trabajando en este repo, empieza por estos archivos:
 - [STATUS.md](STATUS.md)
 - [DECISIONS.md](DECISIONS.md)
 
+## Pruebas de Cons. Lit.
+
+Desde la carpeta que contiene `app_tk.py`, ejecuta:
+
+```powershell
+py -m unittest discover -s tests -v
+```
+
+Las pruebas usan Chrome local sin conectarse a SITFA. Cubren búsquedas dentro
+de filas y frames, argumentos DOM de JavaScript, selección del demandado en
+tablas anidadas, parámetros incompletos o de otra persona, codificación del
+HTML, carga de la tabla Tk y acciones de doble clic.
+
+Para verificar contra SITFA usando las credenciales del `.env` local:
+
+```powershell
+py tests/verify_cons_lit_live.py --rit Z-2248-2026
+py tests/verify_cons_lit_live.py --pendientes
+```
+
+La verificación real consulta secuencialmente y guarda un reporte de conteos
+en `debug_dumps/cons_lit_verificacion.json`, que no se publica en Git.
+
 ## Estructura general
 - `main.py`: logica principal de automatizacion y extraccion.
 - `web_app.py`: API FastAPI y UI web.

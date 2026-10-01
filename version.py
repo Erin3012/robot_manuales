@@ -1,3 +1,3 @@
 """Versión generada durante el build."""
 
-APP_VERSION = 4
+APP_VERSION = 5

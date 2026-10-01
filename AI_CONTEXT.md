@@ -20,6 +20,9 @@ This repo is a small automation project for the SITFA judicial system.
 - `crear_exe.py`: PyInstaller build script for `Robot_Manuales_vN.exe` plus `updater_helper.exe`.
 - Litigant selections now preserve the original row `onclick` so Cartola Banco Estado can reuse the real popup parameters instead of guessing them from the visible row text.
 - The Playwright wrapper now rewrites any `arguments[n]` placeholder it sees in a script, which matters for cartola filters and similar multi-argument `execute_script` calls.
+- Child element searches preserve the selected parent and its index; never flatten them into a document-wide selector. JavaScript DOM arguments must be converted from `_ElementLocator` to `ElementHandle` before evaluating.
+- Cons. Lit. must select a concrete `SelectItem` row, not a layout row containing nested tables. Captured RUT/parte/litigant parameters are checked against the selected row; HTML downloads preserve ISO-8859-1 accents.
+- `py -m unittest discover -s tests -v` runs local Chrome and Tk regression tests without connecting to SITFA.
 
 ## How to run
 - CLI / automation: `python main.py`

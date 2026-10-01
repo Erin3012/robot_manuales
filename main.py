@@ -2776,12 +2776,12 @@ def fetch_session_resource_text(driver, resource_url: str) -> tuple[str, str]:
 
     try:
         content_type, content = download_session_resource(driver, resource_url, temp_path)
+        # Las páginas antiguas de SITFA usan ISO-8859-1. Decodificar siempre
+        # como UTF-8 con reemplazo pierde caracteres en encabezados y nombres.
         try:
-            if "text" in (content_type or "").lower() or content.lstrip().startswith(b"<"):
-                return content_type, content.decode("utf-8", errors="replace")
-            return content_type, content.decode("latin-1", errors="replace")
-        except Exception:
-            return content_type, str(content)
+            return content_type, content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return content_type, content.decode("latin-1")
     finally:
         try:
             temp_path.unlink(missing_ok=True)
@@ -3762,6 +3762,13 @@ def _open_litigantes_action_popup_from_litigantes(
                 return None, "popup_open_failed"
 
         target_subject = normalize_litigantes_value(subject_label).strip().upper()
+        # En algunas respuestas SITFA el sujeto llega como ``DDO`` y en otras
+        # como ``DDO.`` (o con espacios/puntuación adicional). Para ubicar la
+        # fila correcta no debemos depender de esa diferencia de formato.
+        def compact_match_value(value: str) -> str:
+            return re.sub(r"[^A-Z0-9]+", "", normalize_litigantes_value(value).upper())
+
+        target_subject_compact = compact_match_value(target_subject)
         target_values: dict[str, str] = {}
         if target_row_data:
             for key in ("Sujeto", "Rut/Pasaporte", "Nombre o Razón Social", "Fec. Nacimiento"):
@@ -3801,7 +3808,18 @@ def _open_litigantes_action_popup_from_litigantes(
 
         for row in rows:
             try:
-                row_cells = row.find_elements(By.TAG_NAME, "td") + row.find_elements(By.TAG_NAME, "th")
+                # find_elements(td) incluye descendientes de tablas anidadas:
+                # una fila de maquetación puede contener todos los sujetos.
+                # Solo las filas SelectItem representan un litigante elegible.
+                row_handler = str(row.get_attribute("onclick") or "")
+                if not re.search(r"\bSelectItem\s*\(", row_handler, re.IGNORECASE):
+                    continue
+                row_args = re.findall(r"'([^']*)'", row_handler)
+                if action_target == "CONS. LIT." and len(row_args) >= 8 and row_args[6].strip() != "0":
+                    # SITFA conserva las filas eliminadas en el popup, pero
+                    # no permite consultar sus causas. Buscar el DDO. vigente.
+                    continue
+                row_cells = row.find_elements(By.CSS_SELECTOR, ":scope > td, :scope > th")
             except WebDriverException:
                 continue
 
@@ -3832,7 +3850,11 @@ def _open_litigantes_action_popup_from_litigantes(
 
             row_composite_text = " ".join(cell_values).upper()
             exact_match = False
-            subject_match = bool(target_subject) and row_values_by_header.get("Sujeto", "") == target_subject
+            compact_cells = [compact_match_value(value) for value in cell_values]
+            subject_match = bool(target_subject_compact) and (
+                compact_match_value(row_values_by_header.get("Sujeto", "")) == target_subject_compact
+                or target_subject_compact in compact_cells
+            )
             if target_values:
                 exact_match = True
                 for key, expected_value in target_values.items():
@@ -3844,7 +3866,7 @@ def _open_litigantes_action_popup_from_litigantes(
                     exact_match = True
                     fallback_count += 1
             else:
-                exact_match = subject_match or any(cell_value == target_subject for cell_value in cell_values)
+                exact_match = subject_match
 
             if not exact_match:
                 continue
@@ -3962,7 +3984,7 @@ def _open_litigantes_action_popup_from_litigantes(
                     return String(value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
                 }
                 var target = arguments[0];
-                var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
+                var elements = Array.from(document.querySelectorAll('button, input, a, span[onclick], td[onclick], div[onclick]'));
                 var matches = [];
                 for (var i = 0; i < elements.length; i++) {
                     var el = elements[i];
@@ -3983,7 +4005,8 @@ def _open_litigantes_action_popup_from_litigantes(
                             value: el.getAttribute('value') || '',
                             text: (el.innerText || el.textContent || '').trim(),
                             title: el.getAttribute('title') || '',
-                            aria: el.getAttribute('aria-label') || ''
+                            aria: el.getAttribute('aria-label') || '',
+                            disabled: !!el.disabled || el.getAttribute('disabled') !== null
                         });
                     }
                 }
@@ -4039,7 +4062,7 @@ def _open_litigantes_action_popup_from_litigantes(
                         capturedUrl = String(url || "");
                         return null;
                     };
-                    var elements = Array.from(document.querySelectorAll('button, input, a, span, td, div'));
+                    var elements = Array.from(document.querySelectorAll('button, input, a, span[onclick], td[onclick], div[onclick]'));
                     for (var i = 0; i < elements.length; i++) {
                         var el = elements[i];
                         var visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
@@ -4183,6 +4206,19 @@ def _open_litigantes_action_popup_from_litigantes(
         emit_log(log_callback, f"{action_log_prefix}: popup {action_target} capturado={bool(popup_url)} url={popup_url!r}")
         if not popup_url:
             return None, "popup_url_missing"
+        if action_target == "CONS. LIT.":
+            query = parse_qs(urlparse(popup_url).query)
+            required = ("RUT_Litigante", "RUT_DV", "CRR_IdParte", "COD_Litigante")
+            if any(not (query.get(key) or [""])[0].strip() for key in required):
+                emit_log(log_callback, f"{action_log_prefix}: consulta rechazada por parametros de litigante incompletos")
+                return None, "litigante_parameters_missing"
+            row_args = re.findall(r"'([^']*)'", row_onclick)
+            if len(row_args) >= 4 and any(
+                query[key][0].strip().upper() != value.strip().upper()
+                for key, value in zip(required, (row_args[0], row_args[1], row_args[2], row_args[3]))
+            ):
+                emit_log(log_callback, f"{action_log_prefix}: parametros capturados no corresponden a la fila seleccionada")
+                return None, "litigante_parameters_mismatch"
         if detected_handle:
             try:
                 driver.switch_to.window(detected_handle)
